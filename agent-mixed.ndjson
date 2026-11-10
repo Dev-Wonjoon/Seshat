@@ -1,0 +1,6 @@
+{"message":"first","level":"info"}
+{"message":
+{"message":"last","level":"warn"}
+{"message":"after-reconnect-001","level":"info"}
+{"message":"es-recovery-001","level":"info"}
+{"message":"restart-recovery-001","level":"info"}

@@ -1,0 +1,48 @@
+HELP.md
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### STS 설정 및 생성 파일 ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### IntelliJ IDEA 설정 및 생성 파일 ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### NetBeans 설정 및 생성 파일 ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code 설정 파일 ###
+.vscode/
+
+/seshat-queue.db
+/seshat-queue.db-wal
+/seshat-queue.db-shm
+
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+/tmp/
