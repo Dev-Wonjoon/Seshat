@@ -3,6 +3,7 @@ package com.seshat.agent;
 import com.seshat.ingestion.dto.*;
 import com.seshat.processing.JavaLogProcessor;
 
+import java.util.Objects;
 import java.util.UUID;
 
 public final class AgentEventFactory {
@@ -14,7 +15,19 @@ public final class AgentEventFactory {
     }
 
     public LogEventRequest create(String raw, ParsingMode mode) {
-        UUID eventId = UUID.randomUUID();
+        return create(UUID.randomUUID(), raw, mode);
+    }
+
+    /**
+     * 지정된 이벤트 ID를 유지하면서 해당 모드의 전송 내용을 만든다.
+     */
+    public LogEventRequest create(
+            UUID eventId,
+            String raw,
+            ParsingMode mode
+    ) {
+        Objects.requireNonNull(eventId);
+        Objects.requireNonNull(mode);
 
         if (mode == ParsingMode.CENTRAL) {
             return new LogEventRequest(

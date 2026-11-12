@@ -605,6 +605,209 @@ class Suite:
         finally:
             self.stop(case["process"])
 
+    def test_agent_control(self):
+        case = self.case("control", mode="CENTRAL")
+        case["source"].write_bytes(b"")
+        endpoint = self.base + "/api/agents/control"
+        lines = []
+        modes = []
+
+        def append_log(message, expected_mode):
+            raw = json.dumps({"message": message}, separators=(",", ":"))
+            with case["source"].open("ab") as stream:
+                stream.write((raw + "\n").encode("utf-8"))
+            lines.append(raw)
+            modes.append(expected_mode)
+
+        def status(target):
+            query = urllib.parse.urlencode(target)
+            return http_json("GET", endpoint + "?" + query)
+
+        def wait_registration(previous_instance=None):
+            query = urllib.parse.urlencode({"run_id": case["run"]})
+
+            def ready():
+                result = http_json("GET", self.base + "/api/agents?" + query)
+                agents = result["agents"]
+                if not agents or agents[0]["status"] != "ONLINE":
+                    return None
+
+                require(len(agents) == 1, "Unexpected heartbeat registrations.")
+                heartbeat = agents[0]["heartbeat"]
+                if heartbeat["instance_id"] == previous_instance:
+                    return None
+
+                target = {
+                    key: heartbeat[key]
+                    for key in ("run_id", "source_id", "instance_id")
+                }
+                control = status(target)
+                require(control["target"] == target, "Control and heartbeat targets differ.")
+                return control if control["active"] else None
+
+            return self.wait(
+                ready, "active control registration", case["process"]
+            )
+
+        def issue(target, mode):
+            request = {
+                "target": target,
+                "request_id": str(uuid.uuid4()),
+                "mode": mode
+            }
+            command = http_json("POST", endpoint + "/commands", request)
+            require(command["mode"] == mode, "Issued command has the wrong mode.")
+            require(
+                http_json("POST", endpoint + "/commands", request) == command,
+                "Retry returned a different command."
+            )
+            return command
+
+        def wait_phase(target, command, phase):
+            def ready():
+                current = status(target)
+                require(current["command"] == command, "Unexpected latest command.")
+                if phase == "PENDING_APPLY":
+                    require(
+                        current["phase"] != "APPLIED",
+                        "Command was reported applied before a new batch started."
+                    )
+                return current if current["phase"] == phase else None
+
+            return self.wait(ready, f"control phase {phase}", case["process"])
+
+        try:
+            self.start_agent(case)
+            initial = wait_registration()
+            target = initial["target"]
+            controller_id = initial["controller_instance_id"]
+            require(
+                initial["applied_mode"] == "CENTRAL" and initial["command"] is None,
+                "Unexpected initial control state."
+            )
+
+            append_log("control-initial", "CENTRAL")
+            self.verify(case, lines, modes)
+
+            first = issue(target, "AGENT")
+            pending = wait_phase(target, first, "PENDING_APPLY")
+            require(pending["applied_mode"] == "CENTRAL", "Mode changed before new input.")
+            append_log("control-switched", "AGENT")
+            applied = wait_phase(target, first, "APPLIED")
+            require(applied["applied_mode"] == "AGENT", "Wrong applied mode.")
+            self.verify(case, lines, modes)
+
+            same_mode = issue(target, "AGENT")
+            wait_phase(target, same_mode, "PENDING_APPLY")
+            self.stable(
+                case,
+                lambda: status(target)["phase"] == "PENDING_APPLY",
+                "Same-mode command applied without new input.",
+                seconds=2.5
+            )
+            append_log("control-same-mode", "AGENT")
+            wait_phase(target, same_mode, "APPLIED")
+            self.verify(case, lines, modes)
+
+            existing_ids = {
+                row["event_id"] for row in self.database_rows(case)
+            }
+            interrupted = issue(target, "CENTRAL")
+            wait_phase(target, interrupted, "PENDING_APPLY")
+
+            agent_log = self.logs[case["process"].pid]
+
+            def control_failures():
+                return agent_log.read_text(
+                    encoding="utf-8", errors="replace"
+                ).count("제어 동기화 실패.")
+
+            failures_before = control_failures()
+            self.stop_server()
+            self.wait(
+                lambda: control_failures() > failures_before,
+                "agent detecting the control outage",
+                case["process"]
+            )
+            append_log("control-during-outage", "AGENT")
+            self.wait(
+                lambda: bool(self.batches(case))
+                        and self.checkpoint_offset(case) == case["source"].stat().st_size,
+                "durable batch during control outage",
+                case["process"]
+            )
+
+            self.start_server()
+            reconnected = wait_registration()
+            require(reconnected["target"] == target, "Agent identity changed.")
+            require(
+                reconnected["controller_instance_id"] != controller_id
+                and reconnected["command"] is None
+                and reconnected["phase"] is None
+                and reconnected["applied_mode"] == "AGENT",
+                "Central restart restored a command or lost the applied mode."
+            )
+            self.verify(case, lines, modes)
+            append_log("control-after-central-restart", "AGENT")
+            self.verify(case, lines, modes)
+
+            before_agent_restart = issue(target, "AGENT")
+            require(
+                before_agent_restart["id"]["controller_instance_id"]
+                == reconnected["controller_instance_id"]
+                and before_agent_restart["id"]["command_version"] == 1,
+                "New controller did not start a new command sequence."
+            )
+            wait_phase(target, before_agent_restart, "PENDING_APPLY")
+
+            competing_target = dict(target, instance_id=str(uuid.uuid4()))
+            try:
+                http_json("POST", endpoint + "/sync", {
+                    "target": competing_target,
+                    "received_command_id": None,
+                    "applied_command_id": None,
+                    "applied_mode": "CENTRAL"
+                })
+            except urllib.error.HTTPError as error:
+                with error:
+                    body = json.load(error)
+                require(
+                    error.code == 409 and body["code"] == "CONTROL_SESSION_CONFLICT",
+                    f"Unexpected competing instance response: {body}"
+                )
+            else:
+                raise AssertionError("A competing instance took over an active session.")
+
+            self.stop(case["process"])
+            self.start_agent(case)
+            restarted = wait_registration(previous_instance=target["instance_id"])
+            require(
+                restarted["controller_instance_id"] == reconnected["controller_instance_id"]
+                and restarted["command"] is None
+                and restarted["phase"] is None
+                and restarted["applied_mode"] == "CENTRAL",
+                "Restarted agent inherited the old instance's command or applied mode."
+            )
+
+            append_log("control-after-agent-restart", "CENTRAL")
+            self.verify(case, lines, modes)
+            require(
+                existing_ids <= {row["event_id"] for row in self.database_rows(case)},
+                "Existing event IDs changed during control transitions."
+            )
+
+            return {
+                "run_id": case["run"],
+                "final_events": len(lines),
+                "stored_modes": modes,
+                "controller_before_restart": controller_id,
+                "controller_after_restart": reconnected["controller_instance_id"],
+                "agent_before_restart": target["instance_id"],
+                "agent_after_restart": restarted["target"]["instance_id"]
+            }
+        finally:
+            self.stop(case["process"])
+
     def wait(self, predicate, description, process=None, timeout=None):
         duration = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + duration
@@ -1233,8 +1436,11 @@ class Suite:
             hit["_source"] for hit in result["hits"]["hits"]
         ]
 
-    def verify(self, case, lines):
+    def verify(self, case, lines, modes=None):
         count = len(lines)
+        if modes is None:
+            modes = [case["mode"]] * count
+        require(len(modes) == count, "Expected a mode for every input line.")
 
         def completed():
             stats = self.stats(case["run"])
@@ -1273,8 +1479,9 @@ class Suite:
         )
 
         require(
-            all(doc["mode"] == case["mode"] for doc in docs),
-            "Wrong stored mode."
+            Counter((doc["raw"], doc["mode"]) for doc in docs)
+            == Counter(zip(lines, modes)),
+            "Elasticsearch stored the wrong mode for an input line."
         )
         require(
             Counter(map(canonical, docs))
@@ -1290,8 +1497,8 @@ class Suite:
             "Incorrect unique event count."
         )
         require(
-            all(row["mode"] == case["mode"] for row in rows),
-            "Wrong queue mode."
+            [row["mode"] for row in rows] == modes,
+            "SQLite stored the wrong mode for an input line."
         )
         require(
             [
@@ -1301,15 +1508,20 @@ class Suite:
             "Queue raw data changed."
         )
 
-        if case["mode"] == "AGENT":
-            payloads = [
-                json.loads(row["payload_json"]) for row in rows
+        agent_payloads = [
+            json.loads(row["payload_json"])
+            for row in rows
+            if row["mode"] == "AGENT"
             ]
-            require(
-                Counter(map(canonical, payloads))
-                == Counter(map(canonical, expected_documents(lines))),
-                "AGENT request metadata differs."
-            )
+        agent_lines = [
+            raw for raw, mode in zip(lines, modes)
+            if mode == "AGENT"
+        ]
+        require(
+            Counter(map(canonical, agent_payloads))
+            == Counter(map(canonical, expected_documents(agent_lines))),
+            "AGENT request metadata differs."
+        )
 
         return docs
 
@@ -1848,6 +2060,10 @@ def main():
         (
             "lost_acknowledgement_and_deduplication",
             suite.test_lost_ack
+        ),
+        (
+            "agent_control_and_apply_confirmation",
+            suite.test_agent_control
         ),
     ]
 

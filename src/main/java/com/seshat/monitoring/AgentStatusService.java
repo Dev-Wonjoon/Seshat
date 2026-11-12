@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.Comparator;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +31,22 @@ public class AgentStatusService {
         }
 
         this.staleAfterMs = staleAfterMs;
+    }
+
+    public ControlCpuSample controlCpuSample(String runId, String sourceId, UUID instanceId) {
+        Observation observation = latest.get(new AgentKey(runId, sourceId));
+        if (observation == null || !instanceId.equals(observation.heartbeat().instanceId())) {
+            return new ControlCpuSample(null, 0L);
+        }
+
+        var current = status(observation, System.nanoTime());
+
+        // ageMs는 내림한 값이므로 유효 기간을 계산할 때 1ms를 빼 둔다.
+        long remainingMs = Math.max(0L, staleAfterMs - current.ageMs() - 1L);
+        return new ControlCpuSample(observation.heartbeat().systemCpuLoad(), remainingMs);
+    }
+
+    public record ControlCpuSample(Double load, long validForMs) {
     }
 
     public void receive(AgentHeartbeatRequest heartbeat) {

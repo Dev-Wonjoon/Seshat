@@ -1,5 +1,6 @@
 package com.seshat.agent;
 
+import com.seshat.control.dto.AgentControlMessages.Target;
 import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.processing.JavaLogProcessor;
 
@@ -8,6 +9,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeoutException;
@@ -113,9 +115,11 @@ public final class AgentMain {
                 Duration.ofSeconds(5);
 
         private final AgentFileQueue queue;
+        private final AgentModeState modeState;
         private final DurableAgentFileSource source;
         private final DurableAgentBatchSender sender;
         private final AgentHeartbeatReporter heartbeat;
+        private final AgentControlClient control;
 
         private final Thread readerThread;
         private final Thread senderThread;
@@ -144,6 +148,7 @@ public final class AgentMain {
                 long maxPendingBytes
         ) throws IOException {
 
+            modeState = new AgentModeState(mode);
             queue = new AgentFileQueue(
                     queueDirectory,
                     inputFile,
@@ -162,15 +167,23 @@ public final class AgentMain {
                 source = new DurableAgentFileSource(
                         queue,
                         eventFactory,
-                        mode
+                        modeState
                 );
 
                 sender = new DurableAgentBatchSender(queue);
+
+                UUID instanceId = UUID.randomUUID();
                 heartbeat = new AgentHeartbeatReporter(
                         queue,
-                        mode,
+                        modeState,
+                        instanceId,
                         maxPendingBatches,
                         maxPendingBytes
+                );
+                control = new AgentControlClient(
+                        endpoint.resolve("../agents/control/sync"),
+                        new Target(runId, sourceId, instanceId),
+                        modeState
                 );
 
                 readerThread = Thread.ofPlatform()
@@ -252,6 +265,7 @@ public final class AgentMain {
                 senderThread.start();
                 readerThread.start();
                 heartbeat.start();
+                control.start();
 
             } catch (RuntimeException | Error error) {
                 recordFailure(error);
@@ -327,9 +341,10 @@ public final class AgentMain {
 
             boolean interrupted = false;
 
-            // 신규 수집 중단을 요청한다.
-            heartbeat.close();
+            // 새 입력을 중단하고 제어와 상태 보고를 종료한다.
             source.close();
+            control.close();
+            heartbeat.close();
 
             try {
                 if (started && failure.get() == null) {

@@ -5,6 +5,8 @@ import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.processing.JavaLogProcessor;
 import org.junit.jupiter.api.Test;
 
+import java.util.UUID;
+
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -114,5 +116,111 @@ class AgentEventFactoryTest {
 
         assertEquals(raw, first.raw());
         assertEquals(raw, second.raw());
+    }
+
+    @Test
+    void 지정한_ID로_성공_이벤트의_모드를_바꿔도_ID와_원문을_유지한다() {
+        UUID eventId = UUID.fromString(
+                "11111111-1111-4111-8111-111111111111"
+        );
+
+        String raw = "  {\"message\":\"모드 전환\",\"value\":123}  ";
+
+        var central = factory.create(
+                eventId,
+                raw,
+                ParsingMode.CENTRAL
+        );
+
+        var agent = factory.create(
+                central.eventId(),
+                central.raw(),
+                ParsingMode.AGENT
+        );
+
+        var centralAgain = factory.create(
+                agent.eventId(),
+                agent.raw(),
+                ParsingMode.CENTRAL
+        );
+
+        assertAll(
+                () -> assertEquals(eventId, central.eventId()),
+                () -> assertEquals(eventId, agent.eventId()),
+                () -> assertEquals(eventId, centralAgain.eventId()),
+                () -> assertEquals(raw, central.raw()),
+                () -> assertEquals(raw, agent.raw()),
+                () -> assertEquals(raw, centralAgain.raw())
+        );
+
+        assertNull(central.parseStatus());
+        assertNull(central.parsed());
+        assertNull(central.parseError());
+
+        assertEquals(ParseStatus.SUCCESS, agent.parseStatus());
+        assertNotNull(agent.parsed());
+        assertNull(agent.parseError());
+        assertEquals(
+                "모드 전환",
+                agent.parsed().path("message").stringValue()
+        );
+        assertEquals(
+                123,
+                agent.parsed().path("value").intValue()
+        );
+
+        // CENTRAL용으로 다시 준비하면 AGENT의 결과를 싣지 않는다.
+        assertNull(centralAgain.parseStatus());
+        assertNull(centralAgain.parsed());
+        assertNull(centralAgain.parseError());
+    }
+
+    @Test
+    void 지정한_ID로_실패_이벤트의_모드를_바꿔도_ID와_원문을_유지한다() {
+        UUID eventId = UUID.fromString(
+                "22222222-2222-4222-8222-222222222222"
+        );
+
+        String raw = "  {\"message\":";
+
+        var central = factory.create(
+                eventId,
+                raw,
+                ParsingMode.CENTRAL
+        );
+
+        var agent = factory.create(
+                central.eventId(),
+                central.raw(),
+                ParsingMode.AGENT
+        );
+
+        var centralAgain = factory.create(
+                agent.eventId(),
+                agent.raw(),
+                ParsingMode.CENTRAL
+        );
+
+        assertAll(
+                () -> assertEquals(eventId, central.eventId()),
+                () -> assertEquals(eventId, agent.eventId()),
+                () -> assertEquals(eventId, centralAgain.eventId()),
+                () -> assertEquals(raw, central.raw()),
+                () -> assertEquals(raw, agent.raw()),
+                () -> assertEquals(raw, centralAgain.raw())
+        );
+
+        assertNull(central.parseStatus());
+        assertNull(central.parsed());
+        assertNull(central.parseError());
+
+        assertEquals(ParseStatus.FAILED, agent.parseStatus());
+        assertNull(agent.parsed());
+        assertNotNull(agent.parseError());
+        assertEquals("INVALID_JSON", agent.parseError().code());
+
+        assertNull(centralAgain.parseStatus());
+        assertNull(centralAgain.parsed());
+        assertNull(centralAgain.parseError());
     }
 }

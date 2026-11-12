@@ -18,6 +18,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 
 import static java.nio.file.StandardOpenOption.READ;
 
@@ -43,7 +44,8 @@ public final class DurableAgentFileSource
 
     private final AgentFileQueue queue;
     private final AgentEventFactory eventFactory;
-    private final ParsingMode mode;
+    private final AgentModeState modeState;
+    private final LongSupplier nanoTime;
 
     private final JsonMapper mapper = JsonMapper.builder()
             .enable(DeserializationFeature.USE_BIG_INTEGER_FOR_INTS)
@@ -59,11 +61,11 @@ public final class DurableAgentFileSource
     // 직렬화된 이벤트만 최대 50건 보관한다.
     // 미전송 배치의 장기 보관 책임은 파일 큐에 있다.
     private final List<byte[]> events = new ArrayList<>();
-
-    private final byte[] batchPrefix;
     private final byte[] batchSuffix =
             "]}".getBytes(StandardCharsets.UTF_8);
-
+    // 구성 중인 배치가 있을 때만 사용한다.
+    private AgentModeState.BatchSelection batchSelection;
+    private byte[] batchPrefix;
     private int batchBytes;
     private long batchStartedAt;
     private long batchEndOffset;
@@ -71,33 +73,29 @@ public final class DurableAgentFileSource
     public DurableAgentFileSource(
             AgentFileQueue queue,
             AgentEventFactory eventFactory,
-            ParsingMode mode
+            AgentModeState modeState
     ) throws IOException {
+        this(queue, eventFactory, modeState, System::nanoTime);
+    }
 
+    /**
+     * 배치 시간 경계를 재현할 수 있도록 시간 공급자를 받는다.
+     */
+    DurableAgentFileSource(
+            AgentFileQueue queue,
+            AgentEventFactory eventFactory,
+            AgentModeState modeState,
+            LongSupplier nanoTime
+    ) throws IOException {
         this.queue = Objects.requireNonNull(queue);
         this.eventFactory = Objects.requireNonNull(eventFactory);
-        this.mode = Objects.requireNonNull(mode);
+        this.modeState = Objects.requireNonNull(modeState);
+        this.nanoTime = Objects.requireNonNull(nanoTime);
 
         queue.validateInputFile();
 
-        // 문자열 값은 JSON 직렬화를 거쳐 이스케이프한다.
-        String prefix =
-                "{\"run_id\":"
-                        + mapper.writeValueAsString(queue.runId())
-                        + ",\"source_id\":"
-                        + mapper.writeValueAsString(queue.sourceId())
-                        + ",\"mode\":"
-                        + mapper.writeValueAsString(mode.name())
-                        + ",\"events\":[";
-
-        batchPrefix = prefix.getBytes(StandardCharsets.UTF_8);
-        batchBytes = emptyBatchBytes();
-
-        if (batchBytes >= MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "Batch metadata exceeds the request limit."
-            );
-        }
+        // 초기 모드의 메타데이터 크기는 시작 전에 검사한다.
+        createBatchPrefix(modeState.snapshot().appliedMode());
     }
 
     @Override
@@ -201,6 +199,27 @@ public final class DurableAgentFileSource
         }
     }
 
+    private byte[] createBatchPrefix(ParsingMode mode) {
+        String prefix =
+                "{\"run_id\":"
+                        + mapper.writeValueAsString(queue.runId())
+                        + ",\"source_id\":"
+                        + mapper.writeValueAsString(queue.sourceId())
+                        + ",\"mode\":"
+                        + mapper.writeValueAsString(mode.name())
+                        + ",\"events\":[";
+
+        byte[] bytes = prefix.getBytes(StandardCharsets.UTF_8);
+
+        if (emptyBatchBytes(bytes) >= MAX_REQUEST_BYTES) {
+            throw new IllegalArgumentException(
+                    "배치 메타데이터가 HTTP 요청 크기 제한을 초과합니다."
+            );
+        }
+
+        return bytes;
+    }
+
     private void validateInput(FileChannel input)
             throws IOException {
 
@@ -237,43 +256,76 @@ public final class DurableAgentFileSource
             long endOffset
     ) throws IOException, InterruptedException {
 
-        long admittedAt = System.nanoTime();
+        long admittedAt = nanoTime.getAsLong();
 
-        var event = eventFactory.create(raw, mode);
+        AgentModeState.BatchSelection selection;
+        byte[] prefix;
+
+        if (events.isEmpty()) {
+            selection = modeState.selectForNextBatch();
+            prefix = createBatchPrefix(selection.mode());
+        } else {
+            selection = batchSelection;
+            prefix = batchPrefix;
+        }
+
+        var event = eventFactory.create(raw, selection.mode());
         byte[] serialized = mapper.writeValueAsBytes(event);
 
-        // 단일 이벤트조차 전송할 수 없으면 앞선 배치를 보관하고 중단한다.
-        if ((long) emptyBatchBytes() + serialized.length
+        // 현재 배치에 들어가지 않으면 기존 배치를 먼저 영속 보관한다.
+        if (!events.isEmpty()
+                && (long) batchBytes + 1 + serialized.length
                 > MAX_REQUEST_BYTES) {
+
+            ParsingMode preparedMode = selection.mode();
 
             flushBatch();
 
+            // 큐 용량 대기가 끝난 뒤 다음 배치의 요청 상태를 예약한다.
+            selection = modeState.selectForNextBatch();
+            prefix = createBatchPrefix(selection.mode());
+            admittedAt = nanoTime.getAsLong();
+
+            if (selection.mode() != preparedMode) {
+                // 아직 배치에 수용하지 않은 이벤트만 같은 ID로 다시 준비한다.
+                event = eventFactory.create(
+                        event.eventId(),
+                        raw,
+                        selection.mode()
+                );
+
+                serialized = mapper.writeValueAsBytes(event);
+            }
+        }
+
+        // 모드가 바뀌면 파싱 결과와 헤더 크기도 달라질 수 있다.
+        if ((long) emptyBatchBytes(prefix) + serialized.length
+                > MAX_REQUEST_BYTES) {
+
             throw new IllegalArgumentException(
-                    "A single event exceeds the HTTP request limit. "
-                            + "Input end offset: " + endOffset
+                    "단일 이벤트가 HTTP 요청 크기 제한을 초과합니다. "
+                            + "입력 종료 위치: " + endOffset
             );
         }
 
-        int separatorBytes = events.isEmpty() ? 0 : 1;
+        boolean firstEvent = events.isEmpty();
+        int separatorBytes = firstEvent ? 0 : 1;
 
-        // 현재 배치에 넣으면 초과하는 경우 앞선 이벤트부터 보관한다.
-        if ((long) batchBytes
-                + separatorBytes
-                + serialized.length
-                > MAX_REQUEST_BYTES) {
-
-            flushBatch();
-            separatorBytes = 0;
-        }
-
-        if (events.isEmpty()) {
+        if (firstEvent) {
+            batchSelection = selection;
+            batchPrefix = prefix;
+            batchBytes = emptyBatchBytes(prefix);
             batchStartedAt = admittedAt;
         }
 
         events.add(serialized);
-
         batchBytes += separatorBytes + serialized.length;
         batchEndOffset = endOffset;
+
+        if (firstEvent) {
+            // 첫 이벤트를 실제 수용한 배치의 모드만 적용 상태로 보고한다.
+            modeState.markApplied(selection);
+        }
 
         if (events.size() >= MAX_BATCH_SIZE) {
             flushBatch();
@@ -286,7 +338,7 @@ public final class DurableAgentFileSource
             throws IOException, InterruptedException {
 
         if (!events.isEmpty()
-                && System.nanoTime() - batchStartedAt
+                && nanoTime.getAsLong() - batchStartedAt
                 >= BATCH_WAIT_NANOS) {
 
             flushBatch();
@@ -313,20 +365,22 @@ public final class DurableAgentFileSource
 
         body.writeBytes(batchSuffix);
 
-        // 파일 큐 보관이 성공한 뒤에만 현재 배치를 비운다.
-        // 큐가 가득 차면 여기서 대기하여 수집에 역압을 적용한다.
+        // 큐 보관이 성공하기 전에는 배치와 예약 모드를 유지한다.
         queue.append(
                 batchEndOffset,
                 body.toByteArray()
         );
 
         events.clear();
-        batchBytes = emptyBatchBytes();
+        batchSelection = null;
+        batchPrefix = null;
+        batchBytes = 0;
         batchStartedAt = 0;
+        batchEndOffset = 0;
     }
 
-    private int emptyBatchBytes() {
-        return batchPrefix.length + batchSuffix.length;
+    private int emptyBatchBytes(byte[] prefix) {
+        return prefix.length + batchSuffix.length;
     }
 
     public CompletionStage<Void> completion() {

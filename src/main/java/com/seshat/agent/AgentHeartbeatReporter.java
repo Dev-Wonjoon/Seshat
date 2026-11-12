@@ -1,6 +1,5 @@
 package com.seshat.agent;
 
-import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.monitoring.dto.AgentHeartbeatRequest;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -11,6 +10,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -20,11 +20,11 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
             System.getLogger(AgentHeartbeatReporter.class.getName());
 
     private final AgentFileQueue queue;
-    private final ParsingMode mode;
+    private final AgentModeState modeState;
     private final int maxPendingBatches;
     private final long maxPendingBytes;
 
-    private final UUID instanceId = UUID.randomUUID();
+    private final UUID instanceId;
 
     private final JsonMapper mapper = JsonMapper.builder().build();
 
@@ -38,12 +38,23 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
 
     public AgentHeartbeatReporter(
             AgentFileQueue queue,
-            ParsingMode mode,
+            AgentModeState modeState,
             int maxPendingBatches,
             long maxPendingBytes
     ) {
-        this.queue = queue;
-        this.mode = mode;
+        this(queue, modeState, UUID.randomUUID(), maxPendingBatches, maxPendingBytes);
+    }
+
+    AgentHeartbeatReporter(
+            AgentFileQueue queue,
+            AgentModeState modeState,
+            UUID instanceId,
+            int maxPendingBatches,
+            long maxPendingBytes
+    ) {
+        this.queue = Objects.requireNonNull(queue);
+        this.modeState = Objects.requireNonNull(modeState);
+        this.instanceId = Objects.requireNonNull(instanceId);
         this.maxPendingBatches = maxPendingBatches;
         this.maxPendingBytes = maxPendingBytes;
 
@@ -227,11 +238,12 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
             pendingBytes = queue.pendingBytes();
         }
 
+        var modeSnapshot = modeState.snapshot();
         return new AgentHeartbeatRequest(
                 queue.runId(),
                 queue.sourceId(),
                 instanceId,
-                mode,
+                modeSnapshot.appliedMode(),
                 processCpuLoad,
                 systemCpuLoad,
                 heapUsedBytes,
