@@ -1,0 +1,46 @@
+name: seshat-experiment
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.5
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    mem_limit: 1g
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    restart: unless-stopped
+
+  central:
+    build: .
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      SERVER_PORT: "8080"
+      SPRING_ELASTICSEARCH_URIS: http://elasticsearch:9200
+      SPRING_DATASOURCE_URL: "jdbc:sqlite:/var/lib/seshat/queue.db?journal_mode=WAL&synchronous=FULL&busy_timeout=5000"
+      SESHAT_QUEUE_WORKER_ENABLED: "true"
+      SESHAT_REPAIR_ENABLED: "false"
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "${SESHAT_PRIVATE_IP:?Set SESHAT_PRIVATE_IP to the server private IPv4 address}:18080:8080"
+    volumes:
+      - sqlite-data:/var/lib/seshat
+    restart: unless-stopped
+
+  web:
+    build: ../seshat-web
+    ports:
+      - "127.0.0.1:18081:80"
+    restart: unless-stopped
+
+volumes:
+  elasticsearch-data:
+  sqlite-data:
