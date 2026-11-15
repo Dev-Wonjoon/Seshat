@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Start test Elasticsearch
+        run: |
+          sudo sysctl -w vm.max_map_count=1048576
+          docker run --detach --name seshat-ci-es \
+            --publish 127.0.0.1:9200:9200 \
+            --env discovery.type=single-node \
+            --env xpack.security.enabled=false \
+            --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+            docker.elastic.co/elasticsearch/elasticsearch:9.4.5
+          curl -fsS --retry 30 --retry-connrefused --retry-delay 2 \
+            --retry-max-time 90 --max-time 5 \
+            'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s'
+
+      - name: Test and build backend
+        env:
+          SPRING_DATASOURCE_URL: jdbc:sqlite:${{ runner.temp }}/seshat-ci.db
+        run: bash ./gradlew --no-daemon test bootJar
+
+      - name: Show Elasticsearch logs on failure
+        if: failure()
+        run: docker logs --tail 100 seshat-ci-es

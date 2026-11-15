@@ -29,8 +29,7 @@ services:
       SESHAT_QUEUE_WORKER_ENABLED: "true"
       SESHAT_REPAIR_ENABLED: "false"
     ports:
-      - "127.0.0.1:18080:8080"
-      - "${SESHAT_PRIVATE_IP:?Set SESHAT_PRIVATE_IP to the server private IPv4 address}:18080:8080"
+      - "${SESHAT_PRIVATE_IP:?Set SESHAT_PRIVATE_IP to the server private IPv4 address}:8080:8080"
     volumes:
       - sqlite-data:/var/lib/seshat
     restart: unless-stopped
@@ -38,7 +37,7 @@ services:
   web:
     build: ../seshat-web
     ports:
-      - "127.0.0.1:18081:80"
+      - "127.0.0.1:5000:80"
     restart: unless-stopped
 
 volumes:
