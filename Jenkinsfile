@@ -1,7 +1,8 @@
-def checkoutRevision(String directory, String repository, String revision) {
+def checkoutMain(String directory, String repository) {
+    def revision
     dir(directory) {
         def result = checkout scmGit(
-            branches: [[name: revision]],
+            branches: [[name: '*/main']],
             extensions: [cleanBeforeCheckout()],
             userRemoteConfigs: [[
                 url: "https://github.com/${repository}.git",
@@ -9,10 +10,13 @@ def checkoutRevision(String directory, String repository, String revision) {
                 refspec: '+refs/heads/main:refs/remotes/origin/main'
             ]]
         )
-        if (result.GIT_COMMIT != revision) {
-            error("Expected ${repository} at ${revision}, got ${result.GIT_COMMIT}")
-        }
+        revision = result.GIT_COMMIT
     }
+    if (revision == null || !(revision ==~ /[0-9a-f]{40}/)) {
+        error("Could not determine the checked-out main commit for ${repository}.")
+    }
+    echo "Selected ${repository} at ${revision}"
+    return revision
 }
 
 pipeline {
@@ -24,21 +28,18 @@ pipeline {
         timeout(time: 30, unit: 'MINUTES')
     }
 
-    parameters {
-        string(name: 'BACKEND_SHA', trim: true, description: 'Full commit SHA from Seshat main')
-        string(name: 'WEB_SHA', trim: true, description: 'Full commit SHA from Seshat-web main')
-        string(name: 'SESHAT_PRIVATE_IP', trim: true, description: 'Private IPv4 address assigned to the deploy host')
-    }
-
     stages {
-        stage('Verify revisions') {
+        stage('Check out main branches') {
             steps {
                 script {
-                    if (!(params.BACKEND_SHA ==~ /[0-9a-f]{40}/) ||
-                        !(params.WEB_SHA ==~ /[0-9a-f]{40}/)) {
-                        error('Enter full 40-character lowercase commit SHAs for both repositories.')
-                    }
+                    env.BACKEND_SHA = checkoutMain('seshat', 'Dev-Wonjoon/Seshat')
+                    env.WEB_SHA = checkoutMain('seshat-web', 'Dev-Wonjoon/Seshat-web')
                 }
+            }
+        }
+
+        stage('Verify revisions') {
+            steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'seshat-github-read',
                     usernameVariable: 'GITHUB_USER',
@@ -55,10 +56,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+private_ip = os.environ.get("SESHAT_PRIVATE_IP")
+if not private_ip:
+    raise SystemExit("Set SESHAT_PRIVATE_IP on the seshat-deploy Jenkins node.")
 try:
-    address = ipaddress.IPv4Address(os.environ["SESHAT_PRIVATE_IP"])
+    address = ipaddress.IPv4Address(private_ip)
 except ValueError:
-    raise SystemExit("Enter the deploy host's private IPv4 address.")
+    raise SystemExit("SESHAT_PRIVATE_IP on the Jenkins node must be a private IPv4 address.")
 if address.is_global or address.is_loopback or address.is_unspecified or address.is_multicast:
     raise SystemExit(f"Use the host's private network address for deployment, got {address}.")
 
@@ -95,15 +99,6 @@ for repository, variable in (
     print(f"CI passed for {repository} at {revision}: {run['html_url']}")
 PY
 ''')
-                }
-            }
-        }
-
-        stage('Check out releases') {
-            steps {
-                script {
-                    checkoutRevision('seshat', 'Dev-Wonjoon/Seshat', params.BACKEND_SHA)
-                    checkoutRevision('seshat-web', 'Dev-Wonjoon/Seshat-web', params.WEB_SHA)
                 }
             }
         }
