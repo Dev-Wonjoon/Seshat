@@ -33,7 +33,7 @@ jobs:
             --env xpack.security.enabled=false \
             --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
             docker.elastic.co/elasticsearch/elasticsearch:9.4.5
-          curl -fsS --retry 30 --retry-connrefused --retry-delay 2 \
+          curl -fsS --retry 30 --retry-all-errors --retry-delay 2 \
             --retry-max-time 90 --max-time 5 \
             'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s'
 
