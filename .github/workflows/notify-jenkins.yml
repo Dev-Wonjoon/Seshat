@@ -1,0 +1,40 @@
+name: Notify Jenkins
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Queue Seshat deployment
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CF_ACCESS_CLIENT_ID:?Missing Actions secret CF_ACCESS_CLIENT_ID}"
+          : "${CF_ACCESS_CLIENT_SECRET:?Missing Actions secret CF_ACCESS_CLIENT_SECRET}"
+          : "${JENKINS_USER:?Missing Actions secret JENKINS_USER}"
+          : "${JENKINS_API_TOKEN:?Missing Actions secret JENKINS_API_TOKEN}"
+
+          status=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' --request POST \
+            --header "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            --header "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            https://jenkins.wjnh.net/job/seshat-deploy/build)
+          if [[ "$status" != "201" ]]; then
+            printf 'Jenkins did not queue the deployment (HTTP %s).\n' "$status" >&2
+            exit 1
+          fi
+          echo "Jenkins accepted the deployment request."
