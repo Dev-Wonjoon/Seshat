@@ -29,10 +29,12 @@ services:
       SESHAT_QUEUE_WORKER_ENABLED: "true"
       SESHAT_REPAIR_ENABLED: "false"
     ports:
-      - "${SESHAT_PRIVATE_IP:?Set SESHAT_PRIVATE_IP to the server private IPv4 address}:8080:8080"
+      - "${SESHAT_PRIVATE_IP:?Set SESHAT_PRIVATE_IP}:8080:8080"
     volumes:
       - sqlite-data:/var/lib/seshat
     restart: unless-stopped
+    env_file:
+      - /etc/seshat/demo.env
 
   web:
     build: ../seshat-web
