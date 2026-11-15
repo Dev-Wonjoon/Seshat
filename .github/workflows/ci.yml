@@ -37,6 +37,13 @@ jobs:
             --retry-max-time 90 --max-time 5 \
             'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s'
 
+      - name: Create test Elasticsearch index
+        run: |
+          curl -fsS --max-time 30 --request PUT \
+            --header 'Content-Type: application/json' \
+            --data-binary @src/main/resources/elasticsearch/seshat-logs-v1.json \
+            http://127.0.0.1:9200/seshat-logs-v1
+
       - name: Test and build backend
         env:
           SPRING_DATASOURCE_URL: jdbc:sqlite:${{ runner.temp }}/seshat-ci.db
