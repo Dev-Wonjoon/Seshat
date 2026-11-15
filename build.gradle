@@ -17,10 +17,15 @@ springBoot {
 	mainClass = 'com.seshat.SeshatApplication'
 }
 
+def windowsHost = System.getProperty('os.name').toLowerCase(Locale.ROOT).startsWith('windows')
+
 tasks.register('runAgent', JavaExec) {
 	dependsOn classes
 	classpath = sourceSets.main.runtimeClasspath
 	mainClass = 'com.seshat.agent.AgentMain'
+	if (windowsHost) {
+		jvmArgs '--enable-native-access=ALL-UNNAMED'
+	}
 }
 
 repositories {
@@ -50,4 +55,48 @@ dependencies {
 
 tasks.named('test') {
 	useJUnitPlatform()
+	if (windowsHost) {
+		jvmArgs '--enable-native-access=ALL-UNNAMED'
+	}
+}
+
+configurations {
+	agentRuntimeClasspath {
+		canBeConsumed = false
+		canBeResolved = true
+	}
+}
+
+dependencies {
+	agentRuntimeClasspath 'tools.jackson.core:jackson-databind'
+	agentRuntimeClasspath 'jakarta.validation:jakarta.validation-api'
+	agentRuntimeClasspath 'commons-io:commons-io:2.22.0'
+}
+
+tasks.register('agentJar', org.springframework.boot.gradle.tasks.bundling.BootJar) {
+	dependsOn tasks.named('classes')
+	archiveFileName.set('agent.jar')
+	targetJavaVersion.set(JavaVersion.VERSION_25)
+	mainClass.set('com.seshat.agent.AgentMain')
+	classpath = configurations.agentRuntimeClasspath
+	includeTools.set(false)
+	layered {
+		enabled.set(false)
+	}
+
+	bootInf {
+		into('classes') {
+			from(sourceSets.main.output.classesDirs) {
+				include 'com/seshat/agent/**'
+				include 'com/seshat/processing/**'
+				include 'com/seshat/ingestion/dto/**'
+				include 'com/seshat/control/dto/AgentControlMessages*.class'
+				include 'com/seshat/monitoring/dto/AgentHeartbeatRequest.class'
+			}
+		}
+	}
+
+	manifest {
+		attributes('Enable-Native-Access': 'ALL-UNNAMED')
+	}
 }

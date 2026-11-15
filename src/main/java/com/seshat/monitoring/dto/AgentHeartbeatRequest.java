@@ -48,6 +48,14 @@ public record AgentHeartbeatRequest(
         @Positive
         Long heapMaxBytes,
 
+        @JsonProperty("host_memory_used_bytes")
+        @PositiveOrZero
+        Long hostMemoryUsedBytes,
+
+        @JsonProperty("host_memory_total_bytes")
+        @Positive
+        Long hostMemoryTotalBytes,
+
         @JsonProperty("pending_batch_count")
         @NotNull
         @PositiveOrZero

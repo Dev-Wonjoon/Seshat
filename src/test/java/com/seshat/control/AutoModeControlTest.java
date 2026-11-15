@@ -6,7 +6,11 @@ import com.seshat.control.AutoModePolicy.Thresholds;
 import com.seshat.control.dto.AgentControlMessages.CreateCommandRequest;
 import com.seshat.control.dto.AgentControlMessages.SyncRequest;
 import com.seshat.control.dto.AgentControlMessages.Target;
+import com.seshat.monitoring.AgentStatusService;
+import com.seshat.monitoring.SystemStatusService;
+import com.seshat.monitoring.dto.AgentHeartbeatRequest;
 import org.junit.jupiter.api.Test;
+import org.springframework.mock.env.MockEnvironment;
 
 import java.time.Duration;
 import java.util.UUID;
@@ -18,6 +22,8 @@ import static com.seshat.control.dto.AgentControlMessages.CommandPhase.PENDING_A
 import static com.seshat.ingestion.dto.ParsingMode.AGENT;
 import static com.seshat.ingestion.dto.ParsingMode.CENTRAL;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 class AutoModeControlTest {
 
@@ -67,6 +73,32 @@ class AutoModeControlTest {
         assertNotNull(reverse);
         assertEquals(CENTRAL, reverse.mode());
         assertEquals(command.id().commandVersion() + 1L, reverse.id().commandVersion());
+    }
+
+    @Test
+    void 시연_CPU는_일치하는_에이전트의_유효한_하트비트에만_적용한다() {
+        var environment = new MockEnvironment()
+                .withProperty("seshat.demo.enabled", "true")
+                .withProperty("seshat.demo.auto.enabled", "true");
+        var systems = mock(SystemStatusService.class);
+        var agents = new AgentStatusService(20_000);
+        var evaluator = new AutoModeEvaluator(systems, agents, environment);
+        var otherInstance = new Target(target.runId(), target.sourceId(), UUID.randomUUID());
+        var heldFor = Duration.ofSeconds(4);
+
+        evaluator.setDemoCpu(target, 0.90, 0.20);
+        assertEquals(CENTRAL, evaluator.evaluate(target, CENTRAL, heldFor).decision().nextMode());
+
+        agents.receive(new AgentHeartbeatRequest(target.runId(), target.sourceId(), target.instanceId(),
+                CENTRAL, null, 0.60, null, null, null, null, 0, 0L, 16, 1024L));
+        assertEquals(AGENT, evaluator.evaluate(target, CENTRAL, heldFor).decision().nextMode());
+        assertEquals(CENTRAL, evaluator.evaluate(otherInstance, CENTRAL, heldFor).decision().nextMode());
+
+        evaluator.setDemoCpu(target, 0.20, 0.90);
+        assertEquals(CENTRAL, evaluator.evaluate(target, AGENT, heldFor).decision().nextMode());
+        evaluator.clearDemoCpu(target);
+        assertEquals(AGENT, evaluator.evaluate(target, AGENT, heldFor).decision().nextMode());
+        verifyNoInteractions(systems);
     }
 
     @Test

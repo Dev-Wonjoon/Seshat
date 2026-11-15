@@ -3,6 +3,7 @@ package com.seshat.logs.controller;
 import co.elastic.clients.elasticsearch._types.ElasticsearchException;
 import com.seshat.ingestion.dto.ApiError;
 import com.seshat.logs.service.LogNotFoundException;
+import com.seshat.logs.service.LogSnapshotExpiredException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -42,6 +43,12 @@ public class LogQueryExceptionHandler {
                         "The requested log document was not found."
                 )
         );
+    }
+
+    @ExceptionHandler(LogSnapshotExpiredException.class)
+    public ResponseEntity<ApiError> snapshotExpired() {
+        return ResponseEntity.status(HttpStatus.GONE)
+                .body(new ApiError("LOG_SNAPSHOT_EXPIRED", "로그 검색이 만료됐습니다."));
     }
 
     @ExceptionHandler({

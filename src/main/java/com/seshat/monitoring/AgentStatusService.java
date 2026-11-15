@@ -62,6 +62,10 @@ public class AgentStatusService {
         ));
     }
 
+    public void removeRun(String runId) {
+        latest.keySet().removeIf(key -> key.runId().equals(runId));
+    }
+
     public AgentStatusResponse list(String runId) {
         if (runId == null || runId.isBlank()) {
             throw new IllegalArgumentException(

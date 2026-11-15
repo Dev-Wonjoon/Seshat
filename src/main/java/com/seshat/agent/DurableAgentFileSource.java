@@ -7,10 +7,10 @@ import tools.jackson.databind.json.JsonMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,15 +20,13 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 
-import static java.nio.file.StandardOpenOption.READ;
-
 /**
  * 같은 원본 파일을 체크포인트부터 이어 읽는 수집기.
  * <p>
  * - LF 또는 CRLF로 끝난 줄만 수집한다.
  * - 최대 50건 또는 첫 이벤트 대기 200ms로 배치를 형성한다.
  * - 완성된 HTTP 본문과 입력 종료 위치를 파일 큐에 보관한다.
- * - 파일 회전·축소는 오류로 전달한다.
+ * - 같은 디렉터리의 .1 회전본을 마저 읽고 새 파일로 전환한다.
  * <p>
  * 하나의 전용 수집 스레드에서만 실행한다.
  */
@@ -41,6 +39,10 @@ public final class DurableAgentFileSource
 
     private static final long BATCH_WAIT_NANOS =
             Duration.ofMillis(200).toNanos();
+
+    private static final long ROTATION_WAIT_NANOS = Duration.ofSeconds(5).toNanos();
+    private static final System.Logger LOG =
+            System.getLogger(DurableAgentFileSource.class.getName());
 
     private final AgentFileQueue queue;
     private final AgentEventFactory eventFactory;
@@ -70,6 +72,11 @@ public final class DurableAgentFileSource
     private long batchStartedAt;
     private long batchEndOffset;
 
+    // 입력 핸들은 수집 스레드에서 열고 전환하고 닫는다.
+    private AgentInputFile currentInput;
+    private boolean waitingForActiveFile;
+    private long missingSince;
+
     public DurableAgentFileSource(
             AgentFileQueue queue,
             AgentEventFactory eventFactory,
@@ -92,8 +99,6 @@ public final class DurableAgentFileSource
         this.modeState = Objects.requireNonNull(modeState);
         this.nanoTime = Objects.requireNonNull(nanoTime);
 
-        queue.validateInputFile();
-
         // 초기 모드의 메타데이터 크기는 시작 전에 검사한다.
         createBatchPrefix(modeState.snapshot().appliedMode());
     }
@@ -106,97 +111,176 @@ public final class DurableAgentFileSource
             );
         }
 
-        try (FileChannel input = FileChannel.open(
-                queue.inputFile(),
-                READ
-        )) {
-            long offset = queue.checkpoint().offset();
-            input.position(offset);
+        try {
+            var start = queue.checkpoint();
+            currentInput = queue.openCheckpointInput(start);
+            try {
+                long offset = start.offset();
+                boolean firstLine = offset == 0;
+                ByteBuffer readBuffer = ByteBuffer.allocate(8192);
+                ByteArrayOutputStream line = new ByteArrayOutputStream();
 
-            boolean firstLine = offset == 0;
-
-            ByteBuffer readBuffer = ByteBuffer.allocate(8192);
-            ByteArrayOutputStream line =
-                    new ByteArrayOutputStream();
-
-            while (!stopRequested.get()) {
-                validateInput(input);
-                flushIfDue();
-
-                readBuffer.clear();
-                int count = input.read(readBuffer);
-
-                if (count < 0) {
-                    // 마지막 조각은 줄바꿈이 추가될 때까지 유지한다.
-                    Thread.sleep(25);
-                    continue;
-                }
-
-                if (count == 0) {
-                    Thread.sleep(25);
-                    continue;
-                }
-
-                readBuffer.flip();
-
-                while (readBuffer.hasRemaining()
-                        && !stopRequested.get()) {
-
+                while (!stopRequested.get()) {
+                    queue.validateInputFile(currentInput);
+                    if (currentInput.size() < offset) {
+                        throw new IOException("읽고 있던 입력 파일이 잘렸습니다.");
+                    }
                     flushIfDue();
 
-                    int value = Byte.toUnsignedInt(
-                            readBuffer.get()
-                    );
-
-                    offset++;
-
-                    if (value != '\n') {
-                        if (line.size() >= MAX_LINE_BYTES) {
-                            flushBatch();
-
-                            throw new IllegalArgumentException(
-                                    "Input line exceeds the 1MiB limit."
-                            );
+                    readBuffer.clear();
+                    int count = currentInput.readAt(offset, readBuffer);
+                    if (count < 0) {
+                        if (tryRotate(offset)) {
+                            if (line.size() > 0) {
+                                LOG.log(System.Logger.Level.WARNING,
+                                        "회전본의 마지막 미완성 줄 {0}바이트를 건너뜁니다.",
+                                        line.size());
+                            }
+                            line.reset();
+                            offset = 0;
+                            firstLine = true;
+                        } else {
+                            Thread.sleep(25);
                         }
-
-                        line.write(value);
                         continue;
                     }
 
-                    String raw = decodeLine(
-                            line.toByteArray()
-                    );
-
-                    if (firstLine && raw.startsWith("\uFEFF")) {
-                        throw new IllegalArgumentException(
-                                "UTF-8 BOM is unsupported."
-                        );
+                    if (count == 0) {
+                        Thread.sleep(25);
+                        continue;
                     }
 
-                    appendEvent(raw, offset);
+                    readBuffer.flip();
 
-                    firstLine = false;
-                    line.reset();
+                    while (readBuffer.hasRemaining()
+                            && !stopRequested.get()) {
+
+                        flushIfDue();
+
+                        int value = Byte.toUnsignedInt(
+                                readBuffer.get()
+                        );
+
+                        offset++;
+
+                        if (value != '\n') {
+                            if (line.size() >= MAX_LINE_BYTES) {
+                                flushBatch();
+
+                                throw new IllegalArgumentException(
+                                        "Input line exceeds the 1MiB limit."
+                                );
+                            }
+
+                            line.write(value);
+                            continue;
+                        }
+
+                        String raw = decodeLine(
+                                line.toByteArray()
+                        );
+
+                        if (firstLine && raw.startsWith("\uFEFF")) {
+                            throw new IllegalArgumentException(
+                                    "UTF-8 BOM is unsupported."
+                            );
+                        }
+
+                        appendEvent(raw, offset);
+
+                        firstLine = false;
+                        line.reset();
+                    }
                 }
+
+                // 종료 요청 시 완성된 줄만 파일 큐에 보관한다.
+                flushBatch();
+            } catch (Throwable failure) {
+                try {
+                    currentInput.close();
+                } catch (IOException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
             }
-
-            // 종료 요청 시 이미 완성된 줄은 파일 큐에 보관한다.
-            // 줄바꿈 없는 마지막 조각의 위치는 확정하지 않는다.
-            flushBatch();
-
+            currentInput.close();
             completion.complete(null);
-
         } catch (Throwable error) {
             if (error instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-
             completion.completeExceptionally(error);
-
             if (error instanceof Error fatal) {
                 throw fatal;
             }
         }
+    }
+
+    private boolean tryRotate(long offset) throws IOException, InterruptedException {
+        AgentInputFile candidate;
+        try {
+            candidate = AgentInputFile.open(queue.inputFile());
+            waitingForActiveFile = false;
+        } catch (NoSuchFileException missing) {
+            long now = System.nanoTime();
+            if (!waitingForActiveFile) {
+                waitingForActiveFile = true;
+                missingSince = now;
+            }
+            if (now - missingSince >= ROTATION_WAIT_NANOS) {
+                throw rotationFailure("새 활성 파일이 대기 시간 내에 생성되지 않았습니다.", missing);
+            }
+            return false;
+        }
+
+        boolean adopted = false;
+        try {
+            if (candidate.id().equals(currentInput.id())) {
+                return false;
+            }
+            verifyPath(queue.rotatedFile(), currentInput.id(), "이전 입력에 해당하는 회전본을 확인할 수 없습니다.");
+
+            long size = currentInput.size();
+            if (size < offset) {
+                throw rotationFailure("회전본이 읽던 위치보다 짧아졌습니다.", null);
+            }
+            if (size > offset) {
+                // 첫 EOF 이후 작성기가 추가한 이전 파일의 바이트를 읽는다.
+                return false;
+            }
+
+            flushBatch();
+
+            // 큐 용량을 기다리는 동안 다음 회전이 일어났는지 확인한다.
+            verifyPath(queue.inputFile(), candidate.id(), "배치 저장 중 활성 파일이 다시 교체됐습니다.");
+            queue.switchInput(currentInput, candidate);
+
+            AgentInputFile previous = currentInput;
+            currentInput = candidate;
+            adopted = true;
+            previous.close();
+            return true;
+        } finally {
+            if (!adopted) {
+                candidate.close();
+            }
+        }
+    }
+
+    private void verifyPath(Path path, String fileId, String reason) throws IOException {
+        try (AgentInputFile input = AgentInputFile.open(path)) {
+            if (!fileId.equals(input.id())) {
+                throw rotationFailure(reason, null);
+            }
+        } catch (NoSuchFileException missing) {
+            throw rotationFailure(reason, missing);
+        }
+    }
+
+    private IOException rotationFailure(String reason, Throwable cause) {
+        return new IOException(reason + " 입력 누락 가능성이 있습니다. "
+                + "입력=" + queue.inputFile()
+                + ", 마지막 영속 오프셋=" + queue.checkpoint().offset(), cause);
     }
 
     private byte[] createBatchPrefix(ParsingMode mode) {
@@ -218,20 +302,6 @@ public final class DurableAgentFileSource
         }
 
         return bytes;
-    }
-
-    private void validateInput(FileChannel input)
-            throws IOException {
-
-        queue.validateInputFile();
-
-        // 마지막 체크포인트 이후까지 읽은 상태에서
-        // 파일이 축소된 경우도 감지한다.
-        if (Files.size(queue.inputFile()) < input.position()) {
-            throw new IOException(
-                    "Input truncation detected while reading."
-            );
-        }
     }
 
     private String decodeLine(byte[] bytes)
@@ -367,6 +437,7 @@ public final class DurableAgentFileSource
 
         // 큐 보관이 성공하기 전에는 배치와 예약 모드를 유지한다.
         queue.append(
+                currentInput,
                 batchEndOffset,
                 body.toByteArray()
         );

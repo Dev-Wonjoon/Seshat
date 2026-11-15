@@ -163,7 +163,7 @@ class AutoModeHttpIntegrationTest {
         long now = System.currentTimeMillis();
         return new SystemStatusResponse(
                 centralMetricsId, "FRESH", now, 1_000L, 20_000L, 1L,
-                now, 0L, 0L, null, loads.get().central(), null, null
+                now, 0L, 0L, null, loads.get().central(), null, null, null, null
         );
     }
 

@@ -181,6 +181,14 @@ public class AgentControlService {
         );
     }
 
+    public synchronized void removeRun(String runId) {
+        sessions.keySet().removeIf(key -> key.runId().equals(runId));
+        commandHistory.keySet().removeIf(target -> target.runId().equals(runId));
+        issuedRequests.values().removeIf(
+                issued -> issued.request().target().runId().equals(runId)
+        );
+    }
+
     private Session requireSession(Target target) {
         if (target.runId().isBlank() || target.sourceId().isBlank()) {
             throw new ControlException(

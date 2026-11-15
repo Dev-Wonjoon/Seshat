@@ -5,6 +5,7 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
@@ -17,17 +18,19 @@ import static java.nio.file.StandardOpenOption.*;
  * 단일 수집 스레드와 단일 전송 스레드에서 사용하는 파일 큐.
  * <p>
  * 배치 파일:
- * 입력 종료 위치 + 경계 해시 + HTTP 본문 + 무결성 해시
+ * 배치 순번 + 파일 식별자 + 입력 종료 위치 + 경계 해시 + HTTP 본문 + 무결성 해시
  * <p>
  * 체크포인트:
  * 원본 파일 식별 정보 + 마지막 영속 보관 위치
  */
 public final class AgentFileQueue implements AutoCloseable {
 
-    private static final int MAGIC = 0x53455331; // 파일 형식 식별자: SES1
+    private static final int MAGIC_V1 = 0x53455331;
+    private static final int MAGIC_V2 = 0x53455332;
+    private static final int MAX_FILE_ID_BYTES = 128;
     private static final int HASH_BYTES = 32;
     private static final int MAX_BODY_BYTES = 1_048_576;
-    private static final int MAX_PACKET_BYTES = MAX_BODY_BYTES + 128;
+    private static final int MAX_PACKET_BYTES = MAX_BODY_BYTES + 256;
 
     private final Path directory;
     private final Path inputFile;
@@ -70,29 +73,16 @@ public final class AgentFileQueue implements AutoCloseable {
         }
 
         this.directory = directory.toAbsolutePath().normalize();
-        this.inputFile = inputFile.toRealPath();
+        Path configured = inputFile.toAbsolutePath().normalize();
+        this.inputFile = configured.getParent().toRealPath().resolve(configured.getFileName());
         this.checkpointFile =
                 this.directory.resolve("checkpoint.properties");
 
         this.maxPendingBatches = maxPendingBatches;
         this.maxPendingBytes = maxPendingBytes;
 
-        var attributes = Files.readAttributes(
-                this.inputFile,
-                BasicFileAttributes.class
-        );
-
-        if (!attributes.isRegularFile()
-                || !Files.isReadable(this.inputFile)) {
-            throw new IOException(
-                    "Input must be a readable regular file."
-            );
-        }
-
         identity = Map.of(
                 "input.path", this.inputFile.toString(),
-                "input.key", String.valueOf(attributes.fileKey()),
-                "input.created", attributes.creationTime().toString(),
                 "run.id", runId,
                 "source.id", sourceId,
                 "endpoint", endpoint.normalize().toString()
@@ -197,7 +187,8 @@ public final class AgentFileQueue implements AutoCloseable {
      * endOffset은 UTF-8 바이트 기준이며 LF 직후 위치여야 한다.
      * 용량 한도에 도달하면 중앙 확인으로 공간이 생길 때까지 대기한다.
      */
-    public synchronized void append(
+    synchronized void append(
+            AgentInputFile input,
             long endOffset,
             byte[] httpBody
     ) throws IOException, InterruptedException {
@@ -220,11 +211,11 @@ public final class AgentFileQueue implements AutoCloseable {
         // 호출자가 대기 중 원본 배열을 변경하지 못하도록 복사한다.
         byte[] body = httpBody.clone();
 
-        validateInput(checkpoint);
-
+        Checkpoint before = checkpoint;
+        validateInput(input, before);
         var next = new Checkpoint(
-                endOffset,
-                boundaryHash(endOffset)
+                input.id(), endOffset, boundaryHash(input, endOffset),
+                Math.incrementExact(before.sequence())
         );
 
         byte[] packet = encode(next, body);
@@ -242,17 +233,20 @@ public final class AgentFileQueue implements AutoCloseable {
             ensureOpen();
         }
 
-        // 대기하는 동안 파일이 교체·축소됐을 수도 있다.
-        validateInput(checkpoint);
+        // 역압이 풀린 뒤에도 같은 핸들에서 배치 경계를 검증한다.
+        if (!before.equals(checkpoint)) {
+            throw new IOException("큐 공간 대기 중 입력 체크포인트가 변경됐습니다.");
+        }
+        validateInput(input, before);
 
-        if (!next.tailHash().equals(boundaryHash(endOffset))) {
+        if (!next.tailHash().equals(boundaryHash(input, endOffset))) {
             throw new IOException(
                     "Input changed while waiting for queue capacity."
             );
         }
 
         try {
-            Path target = batchPath(endOffset);
+            Path target = batchPath(new BatchKey(false, next.sequence()));
 
             if (Files.exists(target)) {
                 throw new IOException(
@@ -312,7 +306,7 @@ public final class AgentFileQueue implements AutoCloseable {
 
         ensureOpen();
 
-        Path path = batchPath(batch.endOffset());
+        Path path = batchPath(batch.key());
 
         // 같은 배치에 대한 중복 확인은 아무 작업도 하지 않는다.
         if (!Files.exists(path)) {
@@ -330,14 +324,16 @@ public final class AgentFileQueue implements AutoCloseable {
 
             Batch stored = readBatch(path);
 
-            if (!stored.tailHash().equals(batch.tailHash())
+            if (stored.endOffset() != batch.endOffset()
+                    || !stored.fileId().equals(batch.fileId())
+                    || !stored.tailHash().equals(batch.tailHash())
                     || !Arrays.equals(stored.body(), batch.body())) {
                 throw new IOException(
                         "Acknowledgement does not match stored batch."
                 );
             }
 
-            if (checkpoint.offset() < batch.endOffset()) {
+            if (!batch.key().legacy() && checkpoint.sequence() < batch.key().order()) {
                 throw new IOException(
                         "Input checkpoint is behind the batch."
                 );
@@ -359,87 +355,157 @@ public final class AgentFileQueue implements AutoCloseable {
 
     private void recover() throws IOException {
         List<Path> batches = batchFiles();
-
-        if (Files.exists(checkpointFile)) {
-            checkpoint = loadCheckpoint();
-
-        } else {
+        if (!Files.exists(checkpointFile)) {
             if (!batches.isEmpty()) {
-                throw new IOException(
-                        "Queue contains batches but has no identity checkpoint."
-                );
+                throw new IOException("체크포인트 없이 배치 파일이 남아 있습니다.");
             }
-
-            checkpoint = new Checkpoint(0, "");
-            saveCheckpoint(checkpoint);
+            try (AgentInputFile input = AgentInputFile.open(inputFile)) {
+                checkpoint = new Checkpoint(input.id(), 0, "", 0);
+                saveCheckpoint(checkpoint);
+            }
+            return;
         }
 
-        // 배치 확정 후 체크포인트 저장 전에 종료된 경우를 복구한다.
+        Properties properties = loadProperties();
+        String version = properties.getProperty("queue.version", "1");
+        if (!version.equals("1") && !version.equals("2")) {
+            throw new IOException("지원하지 않는 체크포인트 버전입니다. " + version);
+        }
+
+        boolean legacy = version.equals("1");
+        Checkpoint recovered = readCheckpoint(properties, legacy);
+        long savedSequence = recovered.sequence();
+        long previousSequence = 0;
+
         for (Path path : batches) {
             Batch batch = readBatch(path);
-
             pendingCount++;
             pendingBytes += Files.size(path);
 
-            if (batch.endOffset() > checkpoint.offset()) {
-                checkpoint = new Checkpoint(
-                        batch.endOffset(),
-                        batch.tailHash()
+            if (batch.key().legacy()) {
+                if (legacy && batch.endOffset() > recovered.offset()) {
+                    recovered = new Checkpoint("", batch.endOffset(), batch.tailHash(), 0);
+                }
+                continue;
+            }
+
+            long sequence = batch.key().order();
+            if (legacy || (previousSequence != 0 && sequence - previousSequence != 1)) {
+                throw new IOException("배치 순번을 복구할 수 없습니다. " + path);
+            }
+            previousSequence = sequence;
+
+            // 배치 확정 뒤 체크포인트 저장 전에 종료된 경우만 복구한다.
+            if (sequence > savedSequence) {
+                if (sequence - savedSequence != 1
+                        || !recovered.fileId().equals(batch.fileId())
+                        || batch.endOffset() <= recovered.offset()) {
+                    throw new IOException("미확정 배치의 입력 위치를 복구할 수 없습니다. " + path);
+                }
+                recovered = new Checkpoint(
+                        batch.fileId(), batch.endOffset(), batch.tailHash(), sequence
                 );
             }
         }
 
-        validateInput(checkpoint);
+        if (legacy) {
+            recovered = upgradeLegacyCheckpoint(properties, recovered);
+        } else {
+            try (AgentInputFile input = openCheckpointInput(recovered)) {
+                validateInput(input, recovered);
+            }
+        }
 
-        // 이후 배치를 확인·삭제해도 입력 위치가 남도록 먼저 저장한다.
-        saveCheckpoint(checkpoint);
+        // 중앙 확인으로 배치가 삭제되기 전에 복구 위치를 저장한다.
+        saveCheckpoint(recovered);
+        checkpoint = recovered;
     }
 
-    private Checkpoint loadCheckpoint() throws IOException {
+    private Properties loadProperties() throws IOException {
         var properties = new Properties();
-
         try (InputStream input = Files.newInputStream(checkpointFile)) {
             properties.load(input);
         }
-
         for (var entry : identity.entrySet()) {
-            if (!entry.getValue().equals(
-                    properties.getProperty(entry.getKey())
-            )) {
-                throw new IOException(
-                        "Queue identity differs: " + entry.getKey()
-                );
+            if (!entry.getValue().equals(properties.getProperty(entry.getKey()))) {
+                throw new IOException("큐 식별 정보가 일치하지 않습니다. " + entry.getKey());
             }
         }
+        return properties;
+    }
 
+    private Checkpoint readCheckpoint(Properties properties, boolean legacy)
+            throws IOException {
         try {
-            long offset = Long.parseLong(
-                    properties.getProperty("input.offset")
-            );
-
+            long offset = Long.parseLong(properties.getProperty("input.offset", "-1"));
             String hash = properties.getProperty("input.tailHash", "");
+            long sequence = legacy ? 0 : Long.parseLong(
+                    properties.getProperty("batch.sequence", "-1")
+            );
+            String fileId = legacy ? "" : properties.getProperty("input.fileId");
 
-            if (offset < 0
-                    || (offset == 0 && !hash.isEmpty())
-                    || (offset > 0 && !hash.matches("[0-9a-f]{64}"))) {
-                throw new IllegalArgumentException(
-                        "Invalid checkpoint."
-                );
+            if (offset < 0 || sequence < 0
+                    || (offset == 0 ? !hash.isEmpty() : !hash.matches("[0-9a-f]{64}"))
+                    || (!legacy && !validFileId(fileId))) {
+                throw new IllegalArgumentException("체크포인트 필드가 올바르지 않습니다.");
+            }
+            return new Checkpoint(fileId, offset, hash, sequence);
+        } catch (IllegalArgumentException error) {
+            throw new IOException("큐 체크포인트를 읽을 수 없습니다.", error);
+        }
+    }
+
+    private Checkpoint upgradeLegacyCheckpoint(Properties old, Checkpoint position)
+            throws IOException {
+        try (AgentInputFile input = AgentInputFile.open(inputFile)) {
+            var attrs = Files.readAttributes(inputFile, BasicFileAttributes.class);
+            if (!Objects.equals(old.getProperty("input.key"), String.valueOf(attrs.fileKey()))
+                    || !Objects.equals(old.getProperty("input.created"),
+                            attrs.creationTime().toString())) {
+                throw new IOException("기존 큐의 원본을 확인할 수 없습니다. 입력 누락 가능성이 있습니다.");
             }
 
-            return new Checkpoint(offset, hash);
-
-        } catch (IllegalArgumentException error) {
-            throw new IOException(
-                    "Invalid checkpoint file.",
-                    error
-            );
+            var upgraded = new Checkpoint(input.id(), position.offset(), position.tailHash(), 0);
+            validateInput(input, upgraded);
+            try (AgentInputFile active = AgentInputFile.open(inputFile)) {
+                if (!active.id().equals(input.id())) {
+                    throw new IOException("기존 큐를 승계하는 동안 활성 파일이 교체됐습니다.");
+                }
+            }
+            return upgraded;
+        } catch (NoSuchFileException missing) {
+            throw missingInput(position, missing);
         }
+    }
+
+    AgentInputFile openCheckpointInput(Checkpoint value) throws IOException {
+        for (Path candidate : List.of(inputFile, rotatedFile())) {
+            AgentInputFile input;
+            try {
+                input = AgentInputFile.open(candidate);
+            } catch (NoSuchFileException ignored) {
+                continue;
+            }
+
+            if (value.fileId().equals(input.id())) {
+                return input;
+            }
+            input.close();
+        }
+        throw missingInput(value, null);
+    }
+
+    private IOException missingInput(Checkpoint value, Throwable cause) {
+        return new IOException("체크포인트의 입력 파일을 찾을 수 없습니다. 입력 누락 가능성이 있습니다. "
+                + "입력=" + inputFile + ", 마지막 영속 오프셋=" + value.offset(), cause);
     }
 
     private void saveCheckpoint(Checkpoint value) throws IOException {
         var properties = new Properties();
         properties.putAll(identity);
+        properties.setProperty("queue.version", "2");
+        properties.setProperty("input.fileId", value.fileId());
+        properties.setProperty("batch.sequence", Long.toString(value.sequence()));
 
         properties.setProperty(
                 "input.offset",
@@ -457,72 +523,57 @@ public final class AgentFileQueue implements AutoCloseable {
         atomicWrite(checkpointFile, bytes.toByteArray());
     }
 
-    private void validateInput(Checkpoint value) throws IOException {
-        var attributes = Files.readAttributes(
-                inputFile,
-                BasicFileAttributes.class
-        );
-
-        boolean sameFile =
-                attributes.isRegularFile()
-                        && identity.get("input.key").equals(
-                        String.valueOf(attributes.fileKey())
-                )
-                        && identity.get("input.created").equals(
-                        attributes.creationTime().toString()
-                );
-
-        if (!sameFile || attributes.size() < value.offset()) {
-            throw new IOException(
-                    "Input rotation or truncation detected."
-            );
+    private void validateInput(AgentInputFile input, Checkpoint value) throws IOException {
+        if (!value.fileId().equals(input.id()) || input.size() < value.offset()) {
+            throw new IOException("입력 파일 식별자가 다르거나 파일이 잘렸습니다.");
         }
-
         if (value.offset() > 0
-                && !value.tailHash().equals(
-                boundaryHash(value.offset())
-        )) {
-            throw new IOException(
-                    "Input checkpoint boundary changed."
-            );
+                && !value.tailHash().equals(boundaryHash(input, value.offset()))) {
+            throw new IOException("입력 체크포인트 경계가 변경됐습니다.");
         }
     }
 
-    /**
-     * 체크포인트 직전 최대 64바이트의 해시.
-     * 같은 파일의 체크포인트 경계가 변경됐는지 확인한다.
-     */
-    private String boundaryHash(long offset) throws IOException {
+    // 줄 경계를 입력을 읽은 핸들에서 다시 확인한다.
+    private String boundaryHash(AgentInputFile input, long offset) throws IOException {
         if (offset < 1) {
-            throw new IOException(
-                    "Checkpoint must follow a complete line."
-            );
+            throw new IOException("입력 위치는 완성 줄 뒤여야 합니다.");
         }
-
         int length = (int) Math.min(64, offset);
-        ByteBuffer bytes = ByteBuffer.allocate(length);
-
-        try (FileChannel input = FileChannel.open(inputFile, READ)) {
-            input.position(offset - length);
-
-            while (bytes.hasRemaining()) {
-                if (input.read(bytes) < 0) {
-                    throw new EOFException(
-                            "Input was truncated."
-                    );
-                }
+        var bytes = ByteBuffer.allocate(length);
+        long start = offset - length;
+        while (bytes.hasRemaining()) {
+            if (input.readAt(start + bytes.position(), bytes) <= 0) {
+                throw new EOFException("체크포인트 경계를 읽는 동안 입력이 잘렸습니다.");
             }
         }
-
         byte[] boundary = bytes.array();
+        if (boundary[length - 1] != '\n') {
+            throw new IOException("체크포인트 경계가 LF로 끝나지 않습니다.");
+        }
+        return HexFormat.of().formatHex(sha256(boundary));
+    }
 
-        if (boundary[boundary.length - 1] != '\n') {
-            throw new IOException(
-                    "Checkpoint must immediately follow LF or CRLF."
-            );
+    private static boolean validFileId(String id) {
+        return id != null && !id.isBlank()
+                && id.chars().allMatch(character -> character >= 0x20 && character < 0x7f)
+                && id.getBytes(StandardCharsets.UTF_8).length <= MAX_FILE_ID_BYTES;
+    }
+
+    synchronized void switchInput(AgentInputFile previous, AgentInputFile next)
+            throws IOException {
+        ensureOpen();
+        validateInput(previous, checkpoint);
+        if (previous.id().equals(next.id())) {
+            throw new IOException("새 활성 파일이 이전 입력과 같습니다.");
         }
 
-        return HexFormat.of().formatHex(sha256(boundary));
+        var switched = new Checkpoint(next.id(), 0, "", checkpoint.sequence());
+        try {
+            saveCheckpoint(switched);
+            checkpoint = switched;
+        } catch (IOException error) {
+            throw markFailed(error);
+        }
     }
 
     private byte[] encode(
@@ -533,7 +584,9 @@ public final class AgentFileQueue implements AutoCloseable {
         var payload = new ByteArrayOutputStream();
 
         try (var output = new DataOutputStream(payload)) {
-            output.writeInt(MAGIC);
+            output.writeInt(MAGIC_V2);
+            output.writeLong(value.sequence());
+            output.writeUTF(value.fileId());
             output.writeLong(value.offset());
             output.writeUTF(value.tailHash());
             output.writeInt(body.length);
@@ -583,11 +636,19 @@ public final class AgentFileQueue implements AutoCloseable {
         try (var input = new DataInputStream(
                 new ByteArrayInputStream(content)
         )) {
-            if (input.readInt() != MAGIC) {
-                throw new IOException("Unknown batch format.");
+            int magic = input.readInt();
+            if (magic != MAGIC_V1 && magic != MAGIC_V2) {
+                throw new IOException("알 수 없는 배치 형식입니다.");
             }
 
+            boolean legacy = magic == MAGIC_V1;
+            long sequence = legacy ? 0 : input.readLong();
+            String fileId = legacy ? "" : input.readUTF();
+            if (!legacy && (sequence < 1 || !validFileId(fileId))) {
+                throw new IOException("배치 순번 또는 파일 식별자가 올바르지 않습니다.");
+            }
             long endOffset = input.readLong();
+            var key = new BatchKey(legacy, legacy ? endOffset : sequence);
             String tailHash = input.readUTF();
             int bodyLength = input.readInt();
 
@@ -604,13 +665,13 @@ public final class AgentFileQueue implements AutoCloseable {
                 throw new IOException("Incomplete batch body.");
             }
 
-            if (!path.equals(batchPath(endOffset))) {
+            if (!path.equals(batchPath(key))) {
                 throw new IOException(
                         "Batch filename and checkpoint differ."
                 );
             }
 
-            return new Batch(endOffset, tailHash, body);
+            return new Batch(key, fileId, endOffset, tailHash, body);
         }
     }
 
@@ -619,7 +680,7 @@ public final class AgentFileQueue implements AutoCloseable {
             return files
                     .filter(path -> path.getFileName()
                             .toString()
-                            .matches("[0-9]{20}\\.batch"))
+                            .matches("(?:seq-)?[0-9]{20}\\.batch"))
                     .sorted()
                     .toList();
         }
@@ -637,10 +698,9 @@ public final class AgentFileQueue implements AutoCloseable {
         return files.getFirst();
     }
 
-    private Path batchPath(long endOffset) {
-        return directory.resolve(
-                String.format(Locale.ROOT, "%020d.batch", endOffset)
-        );
+    private Path batchPath(BatchKey key) {
+        String format = key.legacy() ? "%020d.batch" : "seq-%020d.batch";
+        return directory.resolve(String.format(Locale.ROOT, format, key.order()));
     }
 
     private IOException markFailed(IOException cause) {
@@ -695,21 +755,23 @@ public final class AgentFileQueue implements AutoCloseable {
         return URI.create(identity.get("endpoint"));
     }
 
-    public synchronized void validateInputFile() throws IOException {
-        ensureOpen();
-        validateInput(checkpoint);
+    Path rotatedFile() {
+        return inputFile.resolveSibling(inputFile.getFileName() + ".1");
     }
 
-    public record Checkpoint(
-            long offset,
-            String tailHash
-    ) {
+    synchronized void validateInputFile(AgentInputFile input) throws IOException {
+        ensureOpen();
+        validateInput(input, checkpoint);
+    }
+
+    public record Checkpoint(String fileId, long offset, String tailHash, long sequence) {
+    }
+
+    public record BatchKey(boolean legacy, long order) {
     }
 
     public record Batch(
-            long endOffset,
-            String tailHash,
-            byte[] body
+            BatchKey key, String fileId, long endOffset, String tailHash, byte[] body
     ) {
         public Batch {
             body = body.clone();

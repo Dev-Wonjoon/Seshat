@@ -113,7 +113,9 @@ public class SystemStatusService
                 current == null ? null : current.processCpuLoad(),
                 current == null ? null : current.systemCpuLoad(),
                 current == null ? null : current.heapUsedBytes(),
-                current == null ? null : current.heapMaxBytes()
+                current == null ? null : current.heapMaxBytes(),
+                current == null ? null : current.hostMemoryUsedBytes(),
+                current == null ? null : current.hostMemoryTotalBytes()
         );
     }
 
@@ -130,6 +132,8 @@ public class SystemStatusService
     private void sample() {
         Double processCpuLoad = null;
         Double systemCpuLoad = null;
+        Long hostMemoryUsedBytes = null;
+        Long hostMemoryTotalBytes = null;
         Long heapUsedBytes = null;
         Long heapMaxBytes = null;
 
@@ -149,10 +153,17 @@ public class SystemStatusService
                 }
 
                 cpuPrimed = true;
+
+                long totalMemory = os.getTotalMemorySize();
+                long freeMemory = os.getFreeMemorySize();
+                if (totalMemory > 0 && freeMemory >= 0 && freeMemory <= totalMemory) {
+                    hostMemoryUsedBytes = totalMemory - freeMemory;
+                    hostMemoryTotalBytes = totalMemory;
+                }
             }
 
         } catch (RuntimeException ignored) {
-            // 지원하지 않는 CPU 지표는 null로 유지한다.
+            // 지원하지 않는 운영체제 지표는 null로 유지한다.
         }
 
         try {
@@ -182,7 +193,9 @@ public class SystemStatusService
                 processCpuLoad,
                 systemCpuLoad,
                 heapUsedBytes,
-                heapMaxBytes
+                heapMaxBytes,
+                hostMemoryUsedBytes,
+                hostMemoryTotalBytes
         );
     }
 
@@ -208,7 +221,9 @@ public class SystemStatusService
             Double processCpuLoad,
             Double systemCpuLoad,
             Long heapUsedBytes,
-            Long heapMaxBytes
+            Long heapMaxBytes,
+            Long hostMemoryUsedBytes,
+            Long hostMemoryTotalBytes
     ) {
     }
 }

@@ -4,6 +4,8 @@ import com.seshat.ingestion.dto.LogEventRequest;
 import com.seshat.ingestion.dto.ParseStatus;
 import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.processing.JavaLogProcessor;
+import com.seshat.repair.JsonRepairRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -52,17 +54,23 @@ public class QueueProcessingService {
     private final JsonMapper mapper;
     private final JavaLogProcessor processor;
     private final TransactionTemplate transactions;
+    private final JsonRepairRepository repairJobs;
+    private final boolean repairEnabled;
 
     public QueueProcessingService(
             JdbcTemplate jdbcTemplate,
             JsonMapper mapper,
             JavaLogProcessor processor,
-            PlatformTransactionManager transactionManager
+            PlatformTransactionManager transactionManager,
+            JsonRepairRepository repairJobs,
+            @Value("${seshat.repair.enabled:false}") boolean repairEnabled
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.mapper = mapper;
         this.processor = processor;
         this.transactions = new TransactionTemplate(transactionManager);
+        this.repairJobs = repairJobs;
+        this.repairEnabled = repairEnabled;
     }
 
     @Transactional(propagation = Propagation.NEVER)
@@ -79,7 +87,7 @@ public class QueueProcessingService {
             ObjectNode result = prepareResult(queued);
             String resultJson = mapper.writeValueAsString(result);
 
-            saveResult(queued, resultJson);
+            saveResult(queued, result, resultJson);
 
             return Optional.of(new PreparedLogEvent(
                     queued.id(),
@@ -168,6 +176,7 @@ public class QueueProcessingService {
 
     private void saveResult(
             ClaimedEvent queued,
+            ObjectNode result,
             String resultJson
     ) {
         transactions.executeWithoutResult(status -> {
@@ -188,6 +197,12 @@ public class QueueProcessingService {
                 throw new IllegalStateException(
                         "The claimed event could not be updated."
                 );
+            }
+
+            if (repairEnabled
+                    && ParseStatus.FAILED.name().equals(result.path("parse_status").stringValue())
+                    && "INVALID_JSON".equals(result.at("/parse_error/code").stringValue())) {
+                repairJobs.register(queued.runId(), queued.sourceId(), queued.eventId().toString());
             }
         });
     }

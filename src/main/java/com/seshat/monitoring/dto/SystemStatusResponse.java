@@ -44,6 +44,12 @@ public record SystemStatusResponse(
         Long heapUsedBytes,
 
         @JsonProperty("heap_max_bytes")
-        Long heapMaxBytes
+        Long heapMaxBytes,
+
+        @JsonProperty("host_memory_used_bytes")
+        Long hostMemoryUsedBytes,
+
+        @JsonProperty("host_memory_total_bytes")
+        Long hostMemoryTotalBytes
 ) {
 }

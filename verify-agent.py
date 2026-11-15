@@ -128,8 +128,31 @@ def replace_test_file(replacement, original):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def read_agent_batch(path):
+    packet = path.read_bytes()
+    content, checksum = packet[:-32], packet[-32:]
+    require(hashlib.sha256(content).digest() == checksum, "배치 해시가 다릅니다.")
+
+    magic = content[:4]
+    if magic == b"SES1":
+        offset_position = 4
+    elif magic == b"SES2":
+        file_id_length = struct.unpack_from(">H", content, 12)[0]
+        offset_position = 14 + file_id_length
+    else:
+        raise ValueError("알 수 없는 에이전트 배치 형식입니다.")
+
+    end_offset, hash_length = struct.unpack_from(">qH", content, offset_position)
+    position = offset_position + 10 + hash_length
+    body_length = struct.unpack_from(">i", content, position)[0]
+    position += 4
+    require(body_length > 0 and position + body_length == len(content),
+            "배치 본문 길이가 다릅니다.")
+    return end_offset, json.loads(content[position:])
+
+
 class Suite:
-    def __init__(self, project, java, timeout):
+    def __init__(self, project, java, timeout, use_agent_jar=False):
         self.project = project
         self.java = java
         self.timeout = timeout
@@ -150,6 +173,7 @@ class Suite:
         self.server = None
         self.sequence = 0
         self.classpath = None
+        self.agent_jar = project / "build/libs/agent.jar" if use_agent_jar else None
 
         self.fixture_hashes = {
             name: digest(project / name)
@@ -1172,6 +1196,10 @@ class Suite:
         )
         require(wrapper.is_file(), "Gradle wrapper JAR was not found.")
 
+        tasks = ["bootJar"]
+        if self.agent_jar is not None:
+            tasks.append("agentJar")
+
         with (self.output / "build.log").open("wb") as log:
             result = subprocess.run([
                 self.java,
@@ -1180,7 +1208,7 @@ class Suite:
                 str(wrapper),
                 "org.gradle.wrapper.GradleWrapperMain",
                 "--no-daemon",
-                "bootJar"
+                *tasks
             ], cwd=self.project, stdout=log, stderr=subprocess.STDOUT)
 
         require(
@@ -1189,7 +1217,7 @@ class Suite:
         )
 
         candidates = []
-        marker = "BOOT-INF/classes/com/seshat/agent/AgentMain.class"
+        marker = "BOOT-INF/classes/com/seshat/SeshatApplication.class"
 
         for path in (self.project / "build" / "libs").glob("*.jar"):
             with zipfile.ZipFile(path) as archive:
@@ -1265,6 +1293,13 @@ class Suite:
         self.sequence += 1
         path = self.output / f"{self.sequence:02d}-{label}.log"
 
+        agent = main_class == "com.seshat.agent.AgentMain"
+        if agent and self.agent_jar is not None:
+            launch = ["-jar", str(self.agent_jar)]
+        else:
+            native_args = ["--enable-native-access=ALL-UNNAMED"] if agent and os.name == "nt" else []
+            launch = [*native_args, "-cp", self.classpath, main_class]
+
         with path.open("wb") as log:
             process = subprocess.Popen([
                 self.java,
@@ -1274,9 +1309,7 @@ class Suite:
                 "-Dstdout.encoding=UTF-8",
                 "-Dstderr.encoding=UTF-8",
                 "-Dseshat.agent.heartbeat-interval-ms=250",
-                "-cp",
-                self.classpath,
-                main_class,
+                *launch,
                 *map(str, arguments)
             ], cwd=self.project,
                 stdout=log,
@@ -1637,26 +1670,7 @@ class Suite:
 
         path = self.batches(case)[0]
         before_hash = digest(path)
-        packet = path.read_bytes()
-
-        require(
-            hashlib.sha256(packet[:-32]).digest()
-            == packet[-32:],
-            "Bad batch checksum."
-        )
-
-        hash_length = struct.unpack_from(">H", packet, 12)[0]
-        position = 14 + hash_length
-        length = struct.unpack_from(">i", packet, position)[0]
-
-        require(
-            position + 4 + length == len(packet) - 32,
-            "Bad batch length."
-        )
-
-        body = json.loads(
-            packet[position + 4:position + 4 + length]
-        )
+        _, body = read_agent_batch(path)
         expected_ids = {
             event["event_id"] for event in body["events"]
         }
@@ -1730,6 +1744,64 @@ class Suite:
             "final_events": len(lines) + 1
         }
 
+    def test_rotation(self, scenario):
+        if scenario != "online":
+            self.stop_server()
+
+        case = self.case("rotation-" + scenario, capacity=1 if scenario == "full" else 10)
+        active = case["source"].with_name("app.log")
+        case["source"].rename(active)
+        case["source"] = active
+        rotated = active.with_name("app.log.1")
+
+        def line(marker):
+            return json.dumps({"rotation_id": case["run"] + "-" + marker})
+
+        first, last, next_line = (line(name) for name in ("initial", "old-last", "new-first"))
+        active.write_bytes((first + "\n").encode("utf-8"))
+        self.start_agent(case)
+        if scenario == "online":
+            self.verify(case, [first])
+            stored = {}
+        else:
+            self.wait(
+                lambda: len(self.batches(case)) == 1
+                        and self.checkpoint_offset(case) == active.stat().st_size,
+                "회전 전 배치 확정",
+                case["process"],
+            )
+            stored = {path: digest(path) for path in self.batches(case)}
+
+        with active.open("ab") as stream:
+            stream.write((last + "\nunfinished").encode("utf-8"))
+        active.rename(rotated)
+
+        if scenario == "restart":
+            self.stop(case["process"])
+            active.write_bytes((next_line + "\n").encode("utf-8"))
+            self.start_agent(case)
+            require(all(path.exists() and digest(path) == expected for path, expected in stored.items()),
+                    "회전 중 재시작 뒤 이전 배치가 바뀌었습니다.")
+        else:
+            self.stable(
+                case, lambda: case["process"].poll() is None,
+                "활성 경로가 잠시 비었을 때 에이전트가 종료됐습니다.",
+            )
+            active.write_bytes((next_line + "\n").encode("utf-8"))
+
+        previous_ids = {
+            event["event_id"]
+            for path in stored
+            for event in read_agent_batch(path)[1]["events"]
+        }
+        if scenario != "online":
+            self.start_server()
+        self.verify(case, [first, last, next_line])
+        require(previous_ids <= {row["event_id"] for row in self.database_rows(case)},
+                "재전송한 배치의 이벤트 ID가 바뀌었습니다.")
+        self.stop(case["process"])
+        return {"run_id": case["run"], "scenario": scenario}
+
     def test_input_change(self, replacement=False):
         name = "replacement" if replacement else "truncation"
         case = self.case(name)
@@ -1791,7 +1863,10 @@ class Suite:
                 "Input rotation or truncation detected.",
                 "Input truncation detected while reading.",
                 "Input checkpoint boundary changed.",
-                "Checkpoint must immediately follow LF or CRLF."
+                "Checkpoint must immediately follow LF or CRLF.",
+                "파일이 잘렸습니다.",
+                "입력 체크포인트 경계가 변경됐습니다.",
+                "이전 입력에 해당하는 회전본을 확인할 수 없습니다."
             )
         )
 
@@ -2007,6 +2082,10 @@ def main():
         type=float,
         default=90
     )
+    parser.add_argument(
+        "--agent-jar", action="store_true",
+        help="에이전트를 배포 JAR로 빌드하여 java -jar로 검증합니다.",
+    )
     args = parser.parse_args()
 
     if not args.java:
@@ -2018,7 +2097,7 @@ def main():
         parser.error("--timeout must be positive.")
 
     project = Path(__file__).resolve().parent
-    suite = Suite(project, args.java, args.timeout)
+    suite = Suite(project, args.java, args.timeout, args.agent_jar)
 
     tests = [
         (
@@ -2065,6 +2144,10 @@ def main():
             "agent_control_and_apply_confirmation",
             suite.test_agent_control
         ),
+        *[
+            ("file_rotation_" + scenario, lambda scenario=scenario: suite.test_rotation(scenario))
+            for scenario in ("online", "full", "restart")
+        ],
     ]
 
     report = {
@@ -2085,6 +2168,8 @@ def main():
 
         report["java_version"] = suite.java_version
         report["jar_sha256"] = suite.jar_hash
+        if suite.agent_jar is not None:
+            report["agent_jar_sha256"] = digest(suite.agent_jar)
         report["fixture_sha256"] = suite.fixture_hashes
 
         print("Checking Elasticsearch...", flush=True)

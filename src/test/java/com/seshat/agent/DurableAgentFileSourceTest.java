@@ -10,7 +10,13 @@ import org.junit.jupiter.api.io.TempDir;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.net.URI;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Properties;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -325,6 +331,161 @@ class DurableAgentFileSourceTest {
                 ParsingMode.AGENT,
                 restartedState.snapshot().appliedMode()
         );
+    }
+
+    @Test
+    void 회전_후_같은_종료_오프셋의_배치를_순서대로_복구한다() throws Exception {
+        inputFile = tempDir.resolve("app.log");
+        String first = "{\"id\":\"old\"}";
+        String next = "{\"id\":\"new\"}";
+        Files.writeString(inputFile, first + "\n");
+        queue = openQueue(10);
+        startRotationReader();
+        await(() -> queue.pendingBatchCount() == 1);
+        var oldBatch = takeBatch();
+        var oldPosition = queue.checkpoint();
+
+        Files.writeString(inputFile, "미완성", StandardOpenOption.APPEND);
+        Files.move(inputFile, inputFile.resolveSibling("app.log.1"));
+        Files.writeString(inputFile, next + "\n", StandardOpenOption.CREATE_NEW);
+        await(() -> queue.pendingBatchCount() == 2);
+        stopRotationReader();
+        queue.close();
+
+        queue = openQueue(10);
+        assertNotEquals(oldPosition.fileId(), queue.checkpoint().fileId());
+        assertArrayEquals(oldBatch.body(), takeBatch().body());
+        queue.acknowledge(oldBatch);
+        var newBatch = takeBatch();
+        assertEquals(oldBatch.endOffset(), newBatch.endOffset());
+        assertEquals(oldBatch.key().order() + 1, newBatch.key().order());
+        assertEquals(next, inspect(newBatch, ParsingMode.CENTRAL)
+                .path("events").get(0).path("raw").asText());
+    }
+
+    @Test
+    void 배치만_확정된_회전을_재시작하면_회전본에서_남은_줄을_읽는다() throws Exception {
+        inputFile = tempDir.resolve("app.log");
+        Files.writeString(inputFile, "{\"id\":\"first\"}\n");
+        queue = openQueue(10);
+        Path checkpointFile = tempDir.resolve("queue/checkpoint.properties");
+        byte[] beforeBatch = Files.readAllBytes(checkpointFile);
+
+        startRotationReader();
+        await(() -> queue.pendingBatchCount() == 1);
+        var pending = takeBatch();
+        stopRotationReader();
+        queue.close();
+
+        // 배치 파일 확정 뒤 체크포인트 확정 전에 종료된 상태를 재현한다.
+        Files.write(checkpointFile, beforeBatch);
+        String last = "{\"id\":\"last\"}";
+        String next = "{\"id\":\"next\"}";
+        Files.writeString(inputFile, last + "\n", StandardOpenOption.APPEND);
+        Files.move(inputFile, inputFile.resolveSibling("app.log.1"));
+
+        queue = openQueue(10);
+        assertEquals(pending.endOffset(), queue.checkpoint().offset());
+        assertArrayEquals(pending.body(), takeBatch().body());
+        startRotationReader();
+        await(() -> queue.pendingBatchCount() == 2);
+        Files.writeString(inputFile, next + "\n", StandardOpenOption.CREATE_NEW);
+        await(() -> queue.pendingBatchCount() == 3);
+        stopRotationReader();
+
+        queue.acknowledge(pending);
+        var lastBatch = takeBatch();
+        assertEquals(last, inspect(lastBatch, ParsingMode.CENTRAL)
+                .path("events").get(0).path("raw").asText());
+        queue.acknowledge(lastBatch);
+        assertEquals(next, inspect(takeBatch(), ParsingMode.CENTRAL)
+                .path("events").get(0).path("raw").asText());
+    }
+
+    @Test
+    void 기존_큐는_배치_파일을_그대로_승계하고_먼저_전송한다() throws Exception {
+        inputFile = tempDir.resolve("app.log");
+        byte[] line = "{}\n".getBytes(StandardCharsets.UTF_8);
+        byte[] oldBody = "{\"events\":[{\"event_id\":\"legacy\"}]}".getBytes(StandardCharsets.UTF_8);
+        Files.write(inputFile, line);
+        var attrs = Files.readAttributes(inputFile, java.nio.file.attribute.BasicFileAttributes.class);
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(line));
+        Path directory = Files.createDirectory(tempDir.resolve("queue"));
+        var properties = new Properties();
+        properties.setProperty("input.path", inputFile.toRealPath().toString());
+        properties.setProperty("input.key", String.valueOf(attrs.fileKey()));
+        properties.setProperty("input.created", attrs.creationTime().toString());
+        properties.setProperty("run.id", RUN_ID);
+        properties.setProperty("source.id", SOURCE_ID);
+        properties.setProperty("endpoint", ENDPOINT.toString());
+        properties.setProperty("input.offset", "0");
+        try (var output = Files.newOutputStream(directory.resolve("checkpoint.properties"))) {
+            properties.store(output, null);
+        }
+
+        var content = new ByteArrayOutputStream();
+        try (var output = new DataOutputStream(content)) {
+            output.writeInt(0x53455331);
+            output.writeLong(line.length);
+            output.writeUTF(hash);
+            output.writeInt(oldBody.length);
+            output.write(oldBody);
+        }
+        content.writeBytes(MessageDigest.getInstance("SHA-256").digest(content.toByteArray()));
+        byte[] oldPacket = content.toByteArray();
+        Path oldPath = Files.write(directory.resolve("00000000000000000003.batch"), oldPacket);
+
+        queue = openQueue(10);
+        assertEquals(line.length, queue.checkpoint().offset());
+        assertArrayEquals(oldPacket, Files.readAllBytes(oldPath));
+        var legacy = takeBatch();
+        assertTrue(legacy.key().legacy());
+        assertArrayEquals(oldBody, legacy.body());
+
+        Files.move(inputFile, inputFile.resolveSibling("app.log.1"));
+        Files.write(inputFile, line, StandardOpenOption.CREATE_NEW);
+        startRotationReader();
+        await(() -> queue.pendingBatchCount() == 2);
+        assertTrue(takeBatch().key().legacy());
+        queue.acknowledge(legacy);
+        assertFalse(takeBatch().key().legacy());
+        assertEquals(line.length, takeBatch().endOffset());
+    }
+
+    @Test
+    void 필요한_회전본이_없으면_체크포인트와_미전송_배치를_보존한다() throws Exception {
+        inputFile = tempDir.resolve("app.log");
+        Files.writeString(inputFile, "{\"id\":\"old\"}\n");
+        queue = openQueue(10);
+        startRotationReader();
+        await(() -> queue.pendingBatchCount() == 1);
+        stopRotationReader();
+        queue.close();
+
+        Path checkpoint = tempDir.resolve("queue/checkpoint.properties");
+        Path batch = tempDir.resolve("queue/seq-00000000000000000001.batch");
+        byte[] before = Files.readAllBytes(checkpoint);
+        byte[] packet = Files.readAllBytes(batch);
+        Files.move(inputFile, inputFile.resolveSibling("unavailable.log"));
+        Files.writeString(inputFile, "{\"id\":\"new\"}\n", StandardOpenOption.CREATE_NEW);
+
+        var error = assertThrows(IOException.class, () -> openQueue(10));
+        assertTrue(error.getMessage().contains("입력 누락 가능성"));
+        assertArrayEquals(before, Files.readAllBytes(checkpoint));
+        assertArrayEquals(packet, Files.readAllBytes(batch));
+    }
+
+    private void startRotationReader() throws Exception {
+        source = new DurableAgentFileSource(
+                queue, new AgentEventFactory(new JavaLogProcessor()),
+                new AgentModeState(ParsingMode.CENTRAL)
+        );
+        reader = Thread.ofPlatform().daemon(true).start(source);
+    }
+
+    private void stopRotationReader() throws Exception {
+        source.close();
+        awaitSource();
     }
 
     private void verifyBatchTransition(

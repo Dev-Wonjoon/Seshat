@@ -189,6 +189,8 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
     private AgentHeartbeatRequest snapshot() {
         Double processCpuLoad = null;
         Double systemCpuLoad = null;
+        Long hostMemoryUsedBytes = null;
+        Long hostMemoryTotalBytes = null;
         Long heapUsedBytes = null;
         Long heapMaxBytes = null;
 
@@ -208,10 +210,17 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
                 }
 
                 cpuPrimed = true;
+
+                long totalMemory = os.getTotalMemorySize();
+                long freeMemory = os.getFreeMemorySize();
+                if (totalMemory > 0 && freeMemory >= 0 && freeMemory <= totalMemory) {
+                    hostMemoryUsedBytes = totalMemory - freeMemory;
+                    hostMemoryTotalBytes = totalMemory;
+                }
             }
 
         } catch (RuntimeException ignored) {
-            // 지원하지 않는 CPU 지표는 null로 유지한다.
+            // 지원하지 않는 운영체제 지표는 null로 유지한다.
         }
 
         try {
@@ -248,6 +257,8 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
                 systemCpuLoad,
                 heapUsedBytes,
                 heapMaxBytes,
+                hostMemoryUsedBytes,
+                hostMemoryTotalBytes,
                 pendingCount,
                 pendingBytes,
                 maxPendingBatches,

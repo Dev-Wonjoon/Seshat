@@ -132,6 +132,35 @@ class QueueStatsControllerTest {
                 );
     }
 
+    @Test
+    void 유입량은_완료된_5초_구간만_집계하고_빈_구간과_대기열을_표시한다()
+            throws Exception {
+        long interval = 5_000;
+        long boundary = System.currentTimeMillis() / interval * interval;
+        insert(runId, "PENDING");
+        insert(runId, "COMPLETED");
+        insert(otherRunId, "RETRY_WAIT");
+        jdbcTemplate.update("UPDATE log_queue SET received_at_ms = ? WHERE run_id = ?",
+                boundary - interval, runId);
+        jdbcTemplate.update("UPDATE log_queue SET received_at_ms = ? WHERE run_id = ?",
+                boundary + 60_000, otherRunId);
+
+        var response = stats.getTraffic();
+        assertEquals(180, response.counts().size());
+        assertEquals(interval, response.bucketMs());
+        assertEquals(900_000, response.windowEndMs() - response.windowStartMs());
+        int index = (int) ((boundary - interval - response.windowStartMs()) / interval);
+        assertEquals(2L, response.counts().get(index));
+        assertEquals(2L, response.counts().stream().mapToLong(Long::longValue).sum());
+
+        mockMvc.perform(get("/api/queue/traffic"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.queued_count").value(1))
+                .andExpect(jsonPath("$.processing_count").value(0))
+                .andExpect(jsonPath("$.retry_wait_count").value(1));
+    }
+
     private void insert(String targetRunId, String state) {
         String eventId = UUID.randomUUID().toString();
 

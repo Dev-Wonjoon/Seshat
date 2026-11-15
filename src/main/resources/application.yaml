@@ -24,3 +24,16 @@ seshat:
   queue:
     worker-enabled: false
     worker-delay-ms: 1000
+
+  repair:
+    enabled: "${SESHAT_REPAIR_ENABLED:false}"
+    scheduler-enabled: true
+    provider: "${SESHAT_REPAIR_PROVIDER:openAiCompatibleRepair}"
+    poll-delay-ms: 1000
+    timeout-ms: 5000
+    max-attempts: 3
+    retry-delay-ms: 1000
+    http:
+      endpoint: "${SESHAT_REPAIR_HTTP_ENDPOINT:}"
+      model: "${SESHAT_REPAIR_HTTP_MODEL:}"
+      api-key: "${SESHAT_REPAIR_HTTP_API_KEY:}"
