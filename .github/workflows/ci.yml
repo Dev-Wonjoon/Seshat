@@ -28,10 +28,11 @@ jobs:
         run: |
           sudo sysctl -w vm.max_map_count=1048576
           docker run --detach --name seshat-ci-es \
+            --memory 4g \
             --publish 127.0.0.1:9200:9200 \
             --env discovery.type=single-node \
             --env xpack.security.enabled=false \
-            --env 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+            --env 'ES_JAVA_OPTS=-Xms2g -Xmx2g' \
             docker.elastic.co/elasticsearch/elasticsearch:9.4.5
           curl -fsS --retry 30 --retry-all-errors --retry-delay 2 \
             --retry-max-time 90 --max-time 5 \
