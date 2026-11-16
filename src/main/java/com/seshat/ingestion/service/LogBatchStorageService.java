@@ -119,7 +119,8 @@ public class LogBatchStorageService {
                 event.raw(),
                 event.parseStatus(),
                 parsed,
-                event.parseError()
+                event.parseError(),
+                event.logFormat()
         );
 
         return mapper.writeValueAsString(normalized);

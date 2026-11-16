@@ -24,6 +24,19 @@ public record LogEventRequest(
 
         @JsonProperty("parse_error")
         @Valid
-        ParseError parseError
+        ParseError parseError,
+        @JsonProperty("log_format")
+        LogFormat logFormat
 ) {
+    public LogEventRequest {
+        if (logFormat == LogFormat.JSON) {
+            logFormat = null;
+        }
+    }
+
+    public LogEventRequest(
+            UUID eventId, String raw, ParseStatus parseStatus, JsonNode parsed, ParseError parseError
+    ) {
+        this(eventId, raw, parseStatus, parsed, parseError, null);
+    }
 }

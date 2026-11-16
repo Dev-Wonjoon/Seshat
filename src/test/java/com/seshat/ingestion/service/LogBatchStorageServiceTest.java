@@ -2,6 +2,7 @@ package com.seshat.ingestion.service;
 
 import com.seshat.ingestion.dto.LogBatchRequest;
 import com.seshat.ingestion.dto.LogEventRequest;
+import com.seshat.ingestion.dto.LogFormat;
 import com.seshat.ingestion.dto.ParseError;
 import com.seshat.ingestion.dto.ParseStatus;
 import com.seshat.ingestion.dto.ParsingMode;
@@ -240,6 +241,18 @@ class LogBatchStorageServiceTest {
                 service.store(batch(ParsingMode.AGENT, replay))
         );
         assertEquals(2L, countRows());
+    }
+
+    @Test
+    void 큐는_입력_형식을_보존하고_재전송에_같은_형식을_요구한다() {
+        String raw = "[23:52:17] [Server thread/INFO]: 저장 완료";
+        var id = new UUID(0, 1);
+        var event = new LogEventRequest(id, raw, null, null, null, LogFormat.MINECRAFT);
+        assertEquals(new BatchStoreResult(1, 1, 0), service.store(batch(ParsingMode.CENTRAL, event)));
+        assertEquals("MINECRAFT", payload(id).path("log_format").stringValue());
+        assertEquals(new BatchStoreResult(1, 0, 1), service.store(batch(ParsingMode.CENTRAL, event)));
+        var different = new LogEventRequest(id, raw, null, null, null, LogFormat.AUTO);
+        assertThrows(EventIdConflictException.class, () -> service.store(batch(ParsingMode.CENTRAL, different)));
     }
 
     private LogEventRequest central(long sequence, String raw) {

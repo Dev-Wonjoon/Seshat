@@ -21,7 +21,10 @@ param(
     [ValidateRange(1, [int]::MaxValue)]
     [int]$MaxPendingBatches = 128,
 
-    [string]$QueuePath
+    [string]$QueuePath,
+
+    [ValidateSet('JSON', 'AUTO', 'MINECRAFT', 'SPRING_BOOT', 'NGINX')]
+    [string]$LogFormat = 'JSON'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,7 +78,7 @@ if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) {
     }
 }
 
-Write-Host "에이전트 실행 $RunId / $SourceId ($Mode)"
+Write-Host "에이전트 실행 $RunId / $SourceId ($Mode / $LogFormat)"
 Write-Host "로그 파일 $logFile"
 Write-Host "큐 디렉터리 $queueDirectory"
 Write-Host 'Ctrl+C로 종료할 수 있습니다.'
@@ -91,6 +94,9 @@ $agentArgs = @(
     $MaxPendingBatches.ToString()
     $queueDirectory
 )
+if ($LogFormat -ne 'JSON') {
+    $agentArgs += "--format=$($LogFormat.ToUpperInvariant())"
+}
 & $java.Source @agentArgs
 if ($LASTEXITCODE -ne 0) {
     throw "에이전트가 종료 코드 $LASTEXITCODE 로 종료됐습니다."

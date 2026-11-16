@@ -1,6 +1,7 @@
 package com.seshat.agent;
 
 import com.seshat.ingestion.dto.ParseStatus;
+import com.seshat.ingestion.dto.LogFormat;
 import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.processing.JavaLogProcessor;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,23 @@ class AgentEventFactoryTest {
 
     private final AgentEventFactory factory =
             new AgentEventFactory(new JavaLogProcessor());
+
+    @Test
+    void 중앙에는_선택한_형식과_원문을_보내고_에이전트는_직접_파싱한다() {
+        var configured = new AgentEventFactory(new JavaLogProcessor(), LogFormat.AUTO);
+        String raw = "[23:52:17] [Server thread/INFO]: 저장 완료";
+        var central = configured.create(raw, ParsingMode.CENTRAL);
+        var agent = configured.create(central.eventId(), raw, ParsingMode.AGENT);
+        assertEquals(LogFormat.AUTO, central.logFormat());
+        assertEquals(raw, central.raw());
+        assertNull(central.parsed());
+        assertNull(central.parseStatus());
+        assertEquals(LogFormat.AUTO, agent.logFormat());
+        assertEquals(raw, agent.raw());
+        assertEquals(ParseStatus.SUCCESS, agent.parseStatus());
+        assertEquals("저장 완료", agent.parsed().path("message").stringValue());
+        assertNull(factory.create("{}", ParsingMode.CENTRAL).logFormat());
+    }
 
     @Test
     void CENTRAL_모드에서는_원문을_파싱하지_않는다() {

@@ -154,7 +154,9 @@ public class QueueProcessingService {
         );
 
         if (queued.mode() == ParsingMode.CENTRAL) {
-            return processor.process(event.raw());
+            return event.logFormat() == null
+                    ? processor.process(event.raw())
+                    : processor.process(event.raw(), event.logFormat());
         }
 
         ObjectNode result = mapper.createObjectNode();

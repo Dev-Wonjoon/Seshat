@@ -1,6 +1,7 @@
 package com.seshat.agent;
 
 import com.seshat.control.dto.AgentControlMessages.Target;
+import com.seshat.ingestion.dto.LogFormat;
 import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.processing.JavaLogProcessor;
 
@@ -25,12 +26,15 @@ public final class AgentMain {
             System.getLogger(AgentMain.class.getName());
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 7 || args.length > 8) {
+        String formatOption = "--format=";
+        boolean hasFormat = args.length >= 8 && args[args.length - 1].startsWith(formatOption);
+        int positionalCount = args.length - (hasFormat ? 1 : 0);
+        if (positionalCount < 7 || positionalCount > 8) {
             throw new IllegalArgumentException(
                     "Usage: <runId> <sourceId> <CENTRAL|AGENT> "
                             + "<inputFile> <batchEndpoint> "
                             + "<maxPendingBatches> <queueDirectory> "
-                            + "[maxPendingBytes]"
+                            + "[maxPendingBytes] [--format=JSON|AUTO|MINECRAFT|SPRING_BOOT|NGINX]"
             );
         }
 
@@ -47,9 +51,12 @@ public final class AgentMain {
         int maxPendingBatches = Integer.parseInt(args[5]);
         Path queueDirectory = Path.of(args[6]);
 
-        long maxPendingBytes = args.length == 8
+        long maxPendingBytes = positionalCount == 8
                 ? Long.parseLong(args[7])
                 : DEFAULT_MAX_QUEUE_BYTES;
+        LogFormat logFormat = hasFormat
+                ? LogFormat.valueOf(args[args.length - 1].substring(formatOption.length()).toUpperCase(Locale.ROOT))
+                : LogFormat.JSON;
 
         if (runId.isBlank() || sourceId.isBlank()) {
             throw new IllegalArgumentException(
@@ -76,6 +83,7 @@ public final class AgentMain {
                 runId,
                 sourceId,
                 mode,
+                logFormat,
                 maxPendingBatches,
                 maxPendingBytes
         )) {
@@ -144,6 +152,7 @@ public final class AgentMain {
                 String runId,
                 String sourceId,
                 ParsingMode mode,
+                LogFormat logFormat,
                 int maxPendingBatches,
                 long maxPendingBytes
         ) throws IOException {
@@ -161,7 +170,7 @@ public final class AgentMain {
 
             try {
                 var eventFactory = new AgentEventFactory(
-                        new JavaLogProcessor()
+                        new JavaLogProcessor(), logFormat
                 );
 
                 source = new DurableAgentFileSource(

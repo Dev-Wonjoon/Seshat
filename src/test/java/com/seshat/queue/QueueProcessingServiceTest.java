@@ -1,7 +1,9 @@
 package com.seshat.queue;
 
+import com.seshat.agent.AgentEventFactory;
 import com.seshat.ingestion.dto.LogBatchRequest;
 import com.seshat.ingestion.dto.LogEventRequest;
+import com.seshat.ingestion.dto.LogFormat;
 import com.seshat.ingestion.dto.ParseError;
 import com.seshat.ingestion.dto.ParseStatus;
 import com.seshat.ingestion.dto.ParsingMode;
@@ -15,6 +17,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -378,6 +381,25 @@ class QueueProcessingServiceTest {
                 prepared.result().path("parse_status").stringValue()
         );
         assertPrepared(prepared, 2);
+    }
+
+    @Test
+    void 양쪽_모드가_같은_2MiB_Minecraft_원문과_파싱_결과를_보존한다() {
+        String header = "[23:52:17] [Server thread/INFO]: ";
+        int bodyBytes = 2 * 1024 * 1024 - header.length();
+        String message = "가".repeat(bodyBytes / 3) + " ".repeat(bodyBytes % 3);
+        String raw = header + message;
+        assertEquals(2 * 1024 * 1024, raw.getBytes(StandardCharsets.UTF_8).length);
+        var factory = new AgentEventFactory(new JavaLogProcessor(), LogFormat.MINECRAFT);
+        store(ParsingMode.CENTRAL, factory.create(raw, ParsingMode.CENTRAL));
+        store(ParsingMode.AGENT, factory.create(raw, ParsingMode.AGENT));
+
+        var central = worker.prepareNext().orElseThrow().result();
+        var agent = worker.prepareNext().orElseThrow().result();
+        assertEquals("SUCCESS", central.path("parse_status").stringValue());
+        assertEquals(raw, central.path("raw").stringValue());
+        assertEquals(message, central.at("/parsed/message").stringValue());
+        assertEquals(central, agent);
     }
 
     private UUID eventId() {

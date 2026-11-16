@@ -9,9 +9,15 @@ import java.util.UUID;
 public final class AgentEventFactory {
 
     private final JavaLogProcessor processor;
+    private final LogFormat logFormat;
 
     public AgentEventFactory(JavaLogProcessor processor) {
+        this(processor, LogFormat.JSON);
+    }
+
+    public AgentEventFactory(JavaLogProcessor processor, LogFormat logFormat) {
         this.processor = processor;
+        this.logFormat = Objects.requireNonNull(logFormat);
     }
 
     public LogEventRequest create(String raw, ParsingMode mode) {
@@ -31,11 +37,11 @@ public final class AgentEventFactory {
 
         if (mode == ParsingMode.CENTRAL) {
             return new LogEventRequest(
-                    eventId, raw, null, null, null
+                    eventId, raw, null, null, null, logFormat
             );
         }
 
-        var result = processor.process(raw);
+        var result = processor.process(raw, logFormat);
         var status = ParseStatus.valueOf(
                 result.path("parse_status").asText()
         );
@@ -46,7 +52,8 @@ public final class AgentEventFactory {
                     raw,
                     status,
                     result.get("parsed"),
-                    null
+                    null,
+                    logFormat
             );
         }
 
@@ -60,7 +67,8 @@ public final class AgentEventFactory {
                 new ParseError(
                         error.path("code").asText(),
                         error.path("message").asText()
-                )
+                ),
+                logFormat
         );
     }
 }
