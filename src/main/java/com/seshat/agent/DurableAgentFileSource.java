@@ -34,8 +34,7 @@ public final class DurableAgentFileSource
         implements Runnable, AutoCloseable {
 
     private static final int MAX_BATCH_SIZE = 50;
-    private static final int MAX_REQUEST_BYTES = 1_048_576;
-    private static final int MAX_LINE_BYTES = 1_048_576;
+    private static final int MAX_LINE_BYTES = 4 * 1024 * 1024;
 
     private static final long BATCH_WAIT_NANOS =
             Duration.ofMillis(200).toNanos();
@@ -48,6 +47,7 @@ public final class DurableAgentFileSource
     private final AgentEventFactory eventFactory;
     private final AgentModeState modeState;
     private final LongSupplier nanoTime;
+    private final int maxRequestBytes;
 
     private final JsonMapper mapper = JsonMapper.builder()
             .enable(DeserializationFeature.USE_BIG_INTEGER_FOR_INTS)
@@ -85,19 +85,31 @@ public final class DurableAgentFileSource
         this(queue, eventFactory, modeState, System::nanoTime);
     }
 
-    /**
-     * 배치 시간 경계를 재현할 수 있도록 시간 공급자를 받는다.
-     */
     DurableAgentFileSource(
             AgentFileQueue queue,
             AgentEventFactory eventFactory,
             AgentModeState modeState,
             LongSupplier nanoTime
     ) throws IOException {
+        this(queue, eventFactory, modeState, nanoTime,
+                AgentBatchLimits.MAX_REQUEST_BYTES);
+    }
+
+    /**
+     * 배치의 시간 경계와 전송 크기 경계를 지정한다.
+     */
+    DurableAgentFileSource(
+            AgentFileQueue queue,
+            AgentEventFactory eventFactory,
+            AgentModeState modeState,
+            LongSupplier nanoTime,
+            int maxRequestBytes
+    ) throws IOException {
         this.queue = Objects.requireNonNull(queue);
         this.eventFactory = Objects.requireNonNull(eventFactory);
         this.modeState = Objects.requireNonNull(modeState);
         this.nanoTime = Objects.requireNonNull(nanoTime);
+        this.maxRequestBytes = maxRequestBytes;
 
         // 초기 모드의 메타데이터 크기는 시작 전에 검사한다.
         createBatchPrefix(modeState.snapshot().appliedMode());
@@ -164,11 +176,14 @@ public final class DurableAgentFileSource
                         offset++;
 
                         if (value != '\n') {
-                            if (line.size() >= MAX_LINE_BYTES) {
+                            // CRLF의 CR을 위해 줄 한도 뒤에 한 바이트를 허용한다.
+                            int maxBytes = MAX_LINE_BYTES
+                                    + (value == '\r' ? 1 : 0);
+                            if (line.size() >= maxBytes) {
                                 flushBatch();
 
                                 throw new IllegalArgumentException(
-                                        "Input line exceeds the 1MiB limit."
+                                        "Input line exceeds the 4 MiB limit."
                                 );
                             }
 
@@ -295,7 +310,7 @@ public final class DurableAgentFileSource
 
         byte[] bytes = prefix.getBytes(StandardCharsets.UTF_8);
 
-        if (emptyBatchBytes(bytes) >= MAX_REQUEST_BYTES) {
+        if (emptyBatchBytes(bytes) >= maxRequestBytes) {
             throw new IllegalArgumentException(
                     "배치 메타데이터가 HTTP 요청 크기 제한을 초과합니다."
             );
@@ -345,7 +360,7 @@ public final class DurableAgentFileSource
         // 현재 배치에 들어가지 않으면 기존 배치를 먼저 영속 보관한다.
         if (!events.isEmpty()
                 && (long) batchBytes + 1 + serialized.length
-                > MAX_REQUEST_BYTES) {
+                > maxRequestBytes) {
 
             ParsingMode preparedMode = selection.mode();
 
@@ -370,7 +385,7 @@ public final class DurableAgentFileSource
 
         // 모드가 바뀌면 파싱 결과와 헤더 크기도 달라질 수 있다.
         if ((long) emptyBatchBytes(prefix) + serialized.length
-                > MAX_REQUEST_BYTES) {
+                > maxRequestBytes) {
 
             throw new IllegalArgumentException(
                     "단일 이벤트가 HTTP 요청 크기 제한을 초과합니다. "

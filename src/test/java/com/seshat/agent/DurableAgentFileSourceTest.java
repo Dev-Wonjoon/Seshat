@@ -86,6 +86,37 @@ class DurableAgentFileSourceTest {
     }
 
     @Test
+    void CRLF를_제외한_4MiB_원문은_보존하고_1바이트_초과는_거절한다()
+            throws Exception {
+        int lineLimit = 4 * 1024 * 1024;
+        int messageLength = lineLimit - largeRaw(0).length();
+        String accepted = largeRaw(messageLength);
+        String oversized = largeRaw(messageLength + 1);
+        assertEquals(lineLimit, accepted.getBytes(StandardCharsets.UTF_8).length);
+
+        inputFile = tempDir.resolve("input.ndjson");
+        Files.writeString(inputFile, accepted + "\r\n" + oversized + "\n",
+                StandardCharsets.UTF_8);
+        queue = openQueue(10);
+        source = new DurableAgentFileSource(
+                queue, new AgentEventFactory(new JavaLogProcessor()),
+                new AgentModeState(ParsingMode.AGENT), () -> 0L
+        );
+        reader = Thread.ofPlatform().daemon(true).start(source);
+
+        var error = assertThrows(ExecutionException.class, this::awaitSource);
+        var cause = assertInstanceOf(IllegalArgumentException.class, error.getCause());
+        assertEquals("Input line exceeds the 4 MiB limit.", cause.getMessage());
+        assertEquals(1, queue.pendingBatchCount());
+        assertEquals(lineLimit + 2L, queue.checkpoint().offset());
+
+        var events = mapper.readTree(takeBatch().body()).path("events");
+        assertEquals(1, events.size());
+        assertEquals("SUCCESS", events.get(0).path("parse_status").asText());
+        assertEquals(accepted, events.get(0).path("raw").asText());
+    }
+
+    @Test
     void CENTRAL에서_AGENT로_전환해도_구성중인_배치의_모드는_유지한다()
             throws Exception {
 
@@ -695,7 +726,8 @@ class DurableAgentFileSourceTest {
                 queue,
                 factory,
                 state,
-                () -> 0L
+                () -> 0L,
+                MAX_REQUEST_BYTES
         );
 
         reader = Thread.ofPlatform()

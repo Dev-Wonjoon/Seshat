@@ -29,7 +29,6 @@ public final class AgentBatchSender implements AutoCloseable {
             System.getLogger(AgentBatchSender.class.getName());
 
     private static final int MAX_BATCH_SIZE = 50;
-    private static final int MAX_REQUEST_BYTES = 1_048_576;
 
     private static final long BATCH_WAIT_NANOS =
             TimeUnit.MILLISECONDS.toNanos(200);
@@ -39,6 +38,7 @@ public final class AgentBatchSender implements AutoCloseable {
     private final String runId;
     private final String sourceId;
     private final ParsingMode mode;
+    private final int maxRequestBytes;
 
     private final JsonMapper mapper = JsonMapper.builder()
             .enable(DeserializationFeature.USE_BIG_INTEGER_FOR_INTS)
@@ -64,11 +64,24 @@ public final class AgentBatchSender implements AutoCloseable {
             String sourceId,
             ParsingMode mode
     ) {
+        this(buffer, endpoint, runId, sourceId, mode,
+                AgentBatchLimits.MAX_REQUEST_BYTES);
+    }
+
+    AgentBatchSender(
+            AgentBuffer buffer,
+            URI endpoint,
+            String runId,
+            String sourceId,
+            ParsingMode mode,
+            int maxRequestBytes
+    ) {
         this.buffer = Objects.requireNonNull(buffer);
         this.endpoint = Objects.requireNonNull(endpoint);
         this.runId = requireNonBlank(runId, "runId");
         this.sourceId = requireNonBlank(sourceId, "sourceId");
         this.mode = Objects.requireNonNull(mode);
+        this.maxRequestBytes = maxRequestBytes;
     }
 
     private static String requireNonBlank(
@@ -155,7 +168,7 @@ public final class AgentBatchSender implements AutoCloseable {
 
             byte[] body = mapper.writeValueAsBytes(request);
 
-            if (body.length <= MAX_REQUEST_BYTES) {
+            if (body.length <= maxRequestBytes) {
                 return new WireBatch(selected, body);
             }
 

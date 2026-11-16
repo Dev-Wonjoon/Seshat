@@ -69,7 +69,8 @@ class AgentBatchSenderTest {
                 endpoint,
                 "run-sender-test",
                 "source-test",
-                ParsingMode.CENTRAL
+                ParsingMode.CENTRAL,
+                MAX_REQUEST_BYTES
         );
     }
 

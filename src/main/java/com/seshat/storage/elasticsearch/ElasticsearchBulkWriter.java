@@ -19,6 +19,9 @@ public class ElasticsearchBulkWriter {
     public static final String INDEX = "seshat-logs-v1";
 
     private static final int MAX_BATCH_SIZE = 50;
+    private static final int MAX_BULK_REQUEST_BYTES = 32 * 1024 * 1024;
+    // 고정 인덱스 이름, SHA-256 문서 ID와 NDJSON 줄바꿈을 포함한 여유분.
+    private static final int ACTION_OVERHEAD_BYTES = 256;
 
     private final ElasticsearchClient client;
     private final ElasticsearchDocumentFactory documents;
@@ -36,46 +39,65 @@ public class ElasticsearchBulkWriter {
 
     public List<BulkItemResult> write(List<PreparedLogEvent> events) throws IOException {
         var batch = List.copyOf(events);
-
-        if(batch.isEmpty()) {
+        if (batch.isEmpty()) {
             return List.of();
         }
-
-        if(batch.size() > MAX_BATCH_SIZE) {
+        if (batch.size() > MAX_BATCH_SIZE) {
             throw new IllegalArgumentException("A bulk request may contain at most 50 events.");
         }
 
-        var request = new BulkRequest.Builder();
         var requestIds = new ArrayList<String>(batch.size());
         Set<String> uniqueIds = new HashSet<>();
-
-        for(var event : batch) {
+        for (var event : batch) {
             String documentId = documents.documentId(event);
-
-            if(!uniqueIds.add(documentId)) {
+            if (!uniqueIds.add(documentId)) {
                 throw new IllegalArgumentException("Duplicate event in the bulk request.");
             }
-
-            byte[] json = mapper.writeValueAsBytes(documents.document(event));
-
-            BinaryData document = BinaryData.of(json, "application/json");
-
             requestIds.add(documentId);
+        }
 
-            request.operations(operation -> operation.index(index -> index
+        var results = new ArrayList<BulkItemResult>(batch.size());
+        var request = new BulkRequest.Builder();
+        int start = 0;
+        long requestBytes = 0;
+        for (int index = 0; index < batch.size(); index++) {
+            byte[] json = mapper.writeValueAsBytes(documents.document(batch.get(index)));
+            long operationBytes = (long) json.length + ACTION_OVERHEAD_BYTES;
+            if (index > start && requestBytes + operationBytes > MAX_BULK_REQUEST_BYTES) {
+                submit(request, batch.subList(start, index),
+                        requestIds.subList(start, index), results);
+                request = new BulkRequest.Builder();
+                start = index;
+                requestBytes = 0;
+            }
+
+            String documentId = requestIds.get(index);
+            BinaryData document = BinaryData.of(json, "application/json");
+            request.operations(operation -> operation.index(operationIndex -> operationIndex
                     .index(INDEX)
                     .id(documentId)
                     .document(document)
             ));
+            requestBytes += operationBytes;
         }
 
+        submit(request, batch.subList(start, batch.size()),
+                requestIds.subList(start, batch.size()), results);
+        return List.copyOf(results);
+    }
+
+    private void submit(
+            BulkRequest.Builder request,
+            List<PreparedLogEvent> batch,
+            List<String> requestIds,
+            List<BulkItemResult> results
+    ) throws IOException {
         var response = client.bulk(request.build());
 
         if(response.items().size() != batch.size()) {
             throw new IOException("Bulk response item count does not match the request.");
         }
 
-        var results = new ArrayList<BulkItemResult>(batch.size());
 
         for(int index = 0; index < batch.size(); index++) {
             var event = batch.get(index);
@@ -102,6 +124,5 @@ public class ElasticsearchBulkWriter {
             ));
         }
 
-        return List.copyOf(results);
     }
 }

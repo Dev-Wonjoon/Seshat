@@ -29,7 +29,7 @@ public final class AgentFileQueue implements AutoCloseable {
     private static final int MAGIC_V2 = 0x53455332;
     private static final int MAX_FILE_ID_BYTES = 128;
     private static final int HASH_BYTES = 32;
-    private static final int MAX_BODY_BYTES = 1_048_576;
+    private static final int MAX_BODY_BYTES = AgentBatchLimits.MAX_REQUEST_BYTES;
     private static final int MAX_PACKET_BYTES = MAX_BODY_BYTES + 256;
 
     private final Path directory;
@@ -204,7 +204,7 @@ public final class AgentFileQueue implements AutoCloseable {
         if (httpBody.length == 0
                 || httpBody.length > MAX_BODY_BYTES) {
             throw new IllegalArgumentException(
-                    "HTTP body must contain 1 to 1MiB bytes."
+                    "HTTP body must contain 1 to " + MAX_BODY_BYTES + " bytes."
             );
         }
 

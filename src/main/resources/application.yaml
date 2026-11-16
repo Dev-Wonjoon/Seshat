@@ -19,7 +19,7 @@ spring:
 
 seshat:
   ingestion:
-    max-request-bytes: 1048576
+    max-request-bytes: 33554432
 
   queue:
     worker-enabled: false

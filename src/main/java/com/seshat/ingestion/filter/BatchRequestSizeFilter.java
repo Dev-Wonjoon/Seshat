@@ -33,7 +33,7 @@ public class BatchRequestSizeFilter extends OncePerRequestFilter {
     private final JsonMapper mapper;
 
     public BatchRequestSizeFilter(
-            @Value("${seshat.ingestion.max-request-bytes:1048576}")
+            @Value("${seshat.ingestion.max-request-bytes:33554432}")
             int maxRequestBytes,
             JsonMapper mapper
     ) {
