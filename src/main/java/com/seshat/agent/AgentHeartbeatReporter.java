@@ -1,5 +1,6 @@
 package com.seshat.agent;
 
+import com.seshat.monitoring.HostMemory;
 import com.seshat.monitoring.dto.AgentHeartbeatRequest;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -189,8 +190,6 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
     private AgentHeartbeatRequest snapshot() {
         Double processCpuLoad = null;
         Double systemCpuLoad = null;
-        Long hostMemoryUsedBytes = null;
-        Long hostMemoryTotalBytes = null;
         Long heapUsedBytes = null;
         Long heapMaxBytes = null;
 
@@ -210,13 +209,6 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
                 }
 
                 cpuPrimed = true;
-
-                long totalMemory = os.getTotalMemorySize();
-                long freeMemory = os.getFreeMemorySize();
-                if (totalMemory > 0 && freeMemory >= 0 && freeMemory <= totalMemory) {
-                    hostMemoryUsedBytes = totalMemory - freeMemory;
-                    hostMemoryTotalBytes = totalMemory;
-                }
             }
 
         } catch (RuntimeException ignored) {
@@ -248,6 +240,7 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
         }
 
         var modeSnapshot = modeState.snapshot();
+        HostMemory hostMemory = HostMemory.read();
         return new AgentHeartbeatRequest(
                 queue.runId(),
                 queue.sourceId(),
@@ -257,8 +250,8 @@ public final class AgentHeartbeatReporter implements AutoCloseable {
                 systemCpuLoad,
                 heapUsedBytes,
                 heapMaxBytes,
-                hostMemoryUsedBytes,
-                hostMemoryTotalBytes,
+                hostMemory == null ? null : hostMemory.usedBytes(),
+                hostMemory == null ? null : hostMemory.totalBytes(),
                 pendingCount,
                 pendingBytes,
                 maxPendingBatches,

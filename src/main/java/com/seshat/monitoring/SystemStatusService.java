@@ -132,8 +132,6 @@ public class SystemStatusService
     private void sample() {
         Double processCpuLoad = null;
         Double systemCpuLoad = null;
-        Long hostMemoryUsedBytes = null;
-        Long hostMemoryTotalBytes = null;
         Long heapUsedBytes = null;
         Long heapMaxBytes = null;
 
@@ -153,13 +151,6 @@ public class SystemStatusService
                 }
 
                 cpuPrimed = true;
-
-                long totalMemory = os.getTotalMemorySize();
-                long freeMemory = os.getFreeMemorySize();
-                if (totalMemory > 0 && freeMemory >= 0 && freeMemory <= totalMemory) {
-                    hostMemoryUsedBytes = totalMemory - freeMemory;
-                    hostMemoryTotalBytes = totalMemory;
-                }
             }
 
         } catch (RuntimeException ignored) {
@@ -184,6 +175,7 @@ public class SystemStatusService
 
         long uptimeMs = ManagementFactory.getRuntimeMXBean()
                 .getUptime();
+        HostMemory hostMemory = HostMemory.read();
 
         latest = new Snapshot(
                 ++sampleSequence,
@@ -194,8 +186,8 @@ public class SystemStatusService
                 systemCpuLoad,
                 heapUsedBytes,
                 heapMaxBytes,
-                hostMemoryUsedBytes,
-                hostMemoryTotalBytes
+                hostMemory == null ? null : hostMemory.usedBytes(),
+                hostMemory == null ? null : hostMemory.totalBytes()
         );
     }
 

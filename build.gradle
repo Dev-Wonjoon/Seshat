@@ -91,6 +91,7 @@ tasks.register('agentJar', org.springframework.boot.gradle.tasks.bundling.BootJa
 				include 'com/seshat/processing/**'
 				include 'com/seshat/ingestion/dto/**'
 				include 'com/seshat/control/dto/AgentControlMessages*.class'
+				include 'com/seshat/monitoring/HostMemory.class'
 				include 'com/seshat/monitoring/dto/AgentHeartbeatRequest.class'
 			}
 		}
