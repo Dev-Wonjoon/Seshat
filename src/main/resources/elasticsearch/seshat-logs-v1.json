@@ -22,6 +22,10 @@
       "raw": {
         "type": "text"
       },
+      "raw_preview": {
+        "type": "keyword",
+        "index": false
+      },
       "parse_status": {
         "type": "keyword"
       },

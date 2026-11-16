@@ -12,6 +12,8 @@ import java.util.List;
 
 @Component
 public class ElasticsearchDocumentFactory {
+    public static final String RAW_PREVIEW = "raw_preview";
+    public static final int PREVIEW_LENGTH = 512;
 
     private final JsonMapper mapper;
 
@@ -45,7 +47,20 @@ public class ElasticsearchDocumentFactory {
         document.put("source_id", event.sourceId());
         document.put("event_id", event.eventId().toString());
         document.put("mode", event.mode().name());
+        var raw = document.get("raw");
+        if (raw != null && raw.isString()) {
+            document.put(RAW_PREVIEW, preview(raw.stringValue()));
+        }
 
         return document;
+    }
+
+    private static String preview(String raw) {
+        int limit = Math.min(raw.length(), PREVIEW_LENGTH * 2 + 1);
+        if (raw.codePointCount(0, limit) <= PREVIEW_LENGTH) {
+            return raw;
+        }
+        int end = raw.offsetByCodePoints(0, PREVIEW_LENGTH - 1);
+        return raw.substring(0, end) + "\u2026";
     }
 }

@@ -1,7 +1,10 @@
 package com.seshat.storage.elasticsearch;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import com.seshat.ingestion.dto.ParseStatus;
 import com.seshat.ingestion.dto.ParsingMode;
+import com.seshat.logs.dto.LogChunkRequest;
+import com.seshat.logs.service.LogQueryService;
 import com.seshat.queue.PreparedLogEvent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -19,7 +22,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -45,6 +50,8 @@ class ElasticsearchBulkWriterIntegrationTest {
 
     @Autowired
     private ElasticsearchClient client;
+    @Autowired
+    private LogQueryService queries;
 
     @Autowired
     private JsonMapper mapper;
@@ -224,6 +231,7 @@ class ElasticsearchBulkWriterIntegrationTest {
         var source = storedSource(event);
 
         assertEquals(raw, source.path("raw").stringValue());
+        assertEquals(raw, source.path("raw_preview").stringValue());
         assertEquals(runId, source.path("run_id").stringValue());
         assertEquals(
                 event.eventId().toString(),
@@ -277,6 +285,66 @@ class ElasticsearchBulkWriterIntegrationTest {
                 source.at("/parse_error/code").stringValue()
         );
         assertFalse(source.has("parsed"));
+    }
+
+    @Test
+    void 대용량_기존_문서와_신규_문서를_미리보기로_조회한다() throws Exception {
+        String prefix = "값" + "🌲".repeat(511);
+        String suffix = " fulltextmarker";
+        int rawBytes = 2 * 1024 * 1024;
+        int padding = rawBytes - prefix.getBytes(StandardCharsets.UTF_8).length - suffix.length();
+        String raw = prefix + "x".repeat(padding) + suffix;
+        String expectedPreview = "값" + "🌲".repeat(510) + "\u2026";
+        var result = mapper.createObjectNode()
+                .put("raw", raw)
+                .put("parse_status", "FAILED");
+        var newEvents = new ArrayList<PreparedLogEvent>();
+        for (int sequence = 1; sequence <= 51; sequence++) {
+            var event = prepared(sequence, result);
+            String id = documents.documentId(event);
+            testDocumentIds.add(id);
+            if (sequence <= 25) {
+                var legacy = documents.document(event);
+                legacy.remove("raw_preview");
+                client.index(request -> request.index(INDEX).id(id).document(legacy));
+            } else {
+                newEvents.add(event);
+            }
+        }
+        assertTrue(writer.write(newEvents).stream().allMatch(BulkItemResult::successful));
+        client.indices().refresh(request -> request.index(INDEX));
+
+        var first = queries.chunk(new LogChunkRequest(runId, null, null, null, null, null, null));
+        String pitId = first.pitId();
+        try {
+            assertEquals(51L, first.totalCount());
+            assertEquals(50, first.items().size());
+            assertNotNull(first.nextCursor());
+            for (var item : first.items()) {
+                assertEquals(expectedPreview, item.rawPreview());
+            }
+
+            var next = queries.chunk(new LogChunkRequest(runId, null, null, null, null, pitId, first.nextCursor()));
+            pitId = next.pitId();
+            assertEquals(1, next.items().size());
+            assertEquals(expectedPreview, next.items().getFirst().rawPreview());
+            assertNull(next.nextCursor());
+        } finally {
+            queries.closeSnapshot(pitId);
+        }
+
+        var page = queries.search(runId, null, null, ParseStatus.FAILED, "fulltextmarker", 0, 51);
+        assertEquals(51L, page.totalCount());
+        assertEquals(51, page.items().size());
+        for (var item : page.items()) {
+            assertEquals(expectedPreview, item.rawPreview());
+        }
+
+        var newEvent = newEvents.getFirst();
+        assertEquals(expectedPreview, storedSource(newEvent).path("raw_preview").stringValue());
+        var detail = queries.detail(documents.documentId(newEvent), runId).document();
+        assertEquals(raw, detail.path("raw").stringValue());
+        assertFalse(detail.has("raw_preview"));
     }
 
     private ObjectNode success(String raw) {

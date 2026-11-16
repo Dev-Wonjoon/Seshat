@@ -1,9 +1,11 @@
 package com.seshat.storage.elasticsearch;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.ElasticsearchException;
 import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.util.BinaryData;
 import com.seshat.queue.PreparedLogEvent;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -12,6 +14,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import static com.seshat.storage.elasticsearch.ElasticsearchDocumentFactory.RAW_PREVIEW;
 
 @Service
 public class ElasticsearchBulkWriter {
@@ -26,6 +30,7 @@ public class ElasticsearchBulkWriter {
     private final ElasticsearchClient client;
     private final ElasticsearchDocumentFactory documents;
     private final JsonMapper mapper;
+    private volatile boolean mappingReady;
 
     public ElasticsearchBulkWriter(
             ElasticsearchClient client,
@@ -56,6 +61,8 @@ public class ElasticsearchBulkWriter {
             requestIds.add(documentId);
         }
 
+        ensureIndexMapping();
+
         var results = new ArrayList<BulkItemResult>(batch.size());
         var request = new BulkRequest.Builder();
         int start = 0;
@@ -84,6 +91,40 @@ public class ElasticsearchBulkWriter {
         submit(request, batch.subList(start, batch.size()),
                 requestIds.subList(start, batch.size()), results);
         return List.copyOf(results);
+    }
+
+    private void ensureIndexMapping() throws IOException {
+        if (mappingReady) {
+            return;
+        }
+        synchronized (this) {
+            if (mappingReady) {
+                return;
+            }
+            if (!client.indices().exists(request -> request.index(INDEX)).value()) {
+                var mapping = new ClassPathResource("elasticsearch/" + INDEX + ".json");
+                try (var input = mapping.getInputStream()) {
+                    var created = client.indices().create(request ->
+                            request.index(INDEX).withJson(input));
+                    if (!created.acknowledged()) {
+                        throw new IOException("Log index creation was not acknowledged.");
+                    }
+                    mappingReady = true;
+                    return;
+                } catch (ElasticsearchException exception) {
+                    if (!"resource_already_exists_exception".equals(exception.error().type())) {
+                        throw exception;
+                    }
+                }
+            }
+            var updated = client.indices().putMapping(request -> request
+                    .index(INDEX)
+                    .properties(RAW_PREVIEW, property -> property.keyword(keyword -> keyword.index(false))));
+            if (!updated.acknowledged()) {
+                throw new IOException("Log preview mapping update was not acknowledged.");
+            }
+            mappingReady = true;
+        }
     }
 
     private void submit(

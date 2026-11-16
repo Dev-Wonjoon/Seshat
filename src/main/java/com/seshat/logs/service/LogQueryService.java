@@ -12,6 +12,7 @@ import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch.core.search.TotalHitsRelation;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.json.JsonData;
 import com.seshat.ingestion.dto.ParseStatus;
 import com.seshat.ingestion.dto.ParsingMode;
 import com.seshat.logs.dto.LogChunkResponse;
@@ -20,6 +21,8 @@ import com.seshat.logs.dto.LogChunkRequest;
 import com.seshat.logs.dto.LogDetailResponse;
 import com.seshat.logs.dto.LogSearchResponse;
 import com.seshat.storage.elasticsearch.ElasticsearchBulkWriter;
+import jakarta.json.JsonArray;
+import jakarta.json.JsonString;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.node.ObjectNode;
 
@@ -27,13 +30,30 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.seshat.storage.elasticsearch.ElasticsearchDocumentFactory.PREVIEW_LENGTH;
+import static com.seshat.storage.elasticsearch.ElasticsearchDocumentFactory.RAW_PREVIEW;
+
 @Service
 public class LogQueryService {
 
     private static final int MAX_PAGE_SIZE = 100;
     private static final int MAX_RESULT_WINDOW = 10_000;
     private static final int MAX_QUERY_LENGTH = 512;
-    private static final int PREVIEW_LENGTH = 512;
+    private static final String PREVIEW_SCRIPT = """
+            if (doc.containsKey('raw_preview') && doc['raw_preview'].size() != 0) {
+                return doc['raw_preview'].value;
+            }
+            String raw = params['_source']['raw'];
+            int limit = (int) params.limit;
+            int scan = limit * 2 + 1;
+            if (raw.length() < scan) {
+                scan = raw.length();
+            }
+            if (raw.codePointCount(0, scan) <= limit) {
+                return raw;
+            }
+            return raw.substring(0, raw.offsetByCodePoints(0, limit - 1)) + '\u2026';
+            """;
 
     private static final int CHUNK_SIZE = 50;
     private static final String PIT_KEEP_ALIVE = "2m";
@@ -68,16 +88,13 @@ public class LogQueryService {
         return value.stringValue();
     }
 
-    private static String preview(String raw) {
-        int length = raw.codePointCount(0, raw.length());
-
-        if (length <= PREVIEW_LENGTH) {
-            return raw;
+    private static String requiredPreview(Hit<ObjectNode> hit) throws IOException {
+        var preview = hit.fields().get(RAW_PREVIEW);
+        if (preview != null && preview.toJson() instanceof JsonArray array
+                && array.size() == 1 && array.getFirst() instanceof JsonString text) {
+            return text.getString();
         }
-
-        int end = raw.offsetByCodePoints(0, PREVIEW_LENGTH - 1);
-
-        return raw.substring(0, end) + "\u2026";
+        throw new IOException("A search hit is missing its log preview.");
     }
 
     private static boolean isMissingIndex(
@@ -114,7 +131,7 @@ public class LogQueryService {
             );
         }
 
-        var request = searchRequest(runId, sourceId, mode, parseStatus, queryText)
+        var request = listSearchRequest(runId, sourceId, mode, parseStatus, queryText)
                 .index(ElasticsearchBulkWriter.INDEX)
                 .sort(s -> s.field(f -> f.field("source_id").order(SortOrder.Asc)))
                 .sort(s -> s.field(f -> f.field("event_id").order(SortOrder.Asc)))
@@ -145,7 +162,7 @@ public class LogQueryService {
     }
 
     public LogChunkResponse chunk(LogChunkRequest input) throws IOException {
-        var request = searchRequest(input.runId(), input.sourceId(), input.mode(),
+        var request = listSearchRequest(input.runId(), input.sourceId(), input.mode(),
                 input.parseStatus(), input.query());
         boolean opening = input.pitId() == null;
         if (opening && input.after() != null) {
@@ -323,9 +340,21 @@ public class LogQueryService {
             items.add(new LogSearchResponse.Item(hit.id(),
                     requiredText(document, "run_id"), requiredText(document, "source_id"),
                     requiredText(document, "event_id"), requiredText(document, "mode"),
-                    requiredText(document, "parse_status"), preview(requiredText(document, "raw"))));
+                    requiredText(document, "parse_status"), requiredPreview(hit)));
         }
         return List.copyOf(items);
+    }
+
+    private static SearchRequest.Builder listSearchRequest(
+            String runId, String sourceId, ParsingMode mode, ParseStatus parseStatus, String queryText
+    ) {
+        return searchRequest(runId, sourceId, mode, parseStatus, queryText)
+                .source(source -> source.filter(filter -> filter.includes(
+                        "run_id", "source_id", "event_id", "mode", "parse_status"
+                )))
+                .scriptFields(RAW_PREVIEW, field -> field.script(script -> script
+                        .source(source -> source.scriptString(PREVIEW_SCRIPT))
+                        .params("limit", JsonData.of(PREVIEW_LENGTH))));
     }
 
     private static SearchRequest.Builder searchRequest(
@@ -376,10 +405,7 @@ public class LogQueryService {
 
         return new SearchRequest.Builder()
                 .allowPartialSearchResults(false)
-                .query(query.build()._toQuery())
-                .source(s -> s.filter(f -> f.includes(
-                        "run_id", "source_id", "event_id", "mode", "parse_status", "raw"
-                )));
+                .query(query.build()._toQuery());
     }
 
     public LogDetailResponse detail(
@@ -419,10 +445,9 @@ public class LogQueryService {
                 throw new LogNotFoundException();
             }
 
-            return new LogDetailResponse(
-                    documentId,
-                    document.deepCopy()
-            );
+            var detail = document.deepCopy();
+            detail.remove(RAW_PREVIEW);
+            return new LogDetailResponse(documentId, detail);
         } catch (ElasticsearchException exception) {
             if (isMissingIndex(exception)) {
                 throw new LogNotFoundException();
