@@ -5,8 +5,10 @@ import com.seshat.ingestion.dto.LogEventRequest;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Validator;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.util.Objects;
@@ -57,6 +59,15 @@ public class LogBatchStorageService {
 
         if (!violations.isEmpty()) {
             throw new ConstraintViolationException(violations);
+        }
+
+        if (Boolean.TRUE.equals(jdbcTemplate.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1 FROM demo_run WHERE run_id = ? AND source_id = ?
+                    AND state IN ('DELETING', 'DELETED')
+                )
+                """, Boolean.class, batch.runId(), batch.sourceId()))) {
+            throw new ResponseStatusException(HttpStatus.GONE, "삭제된 시연 실행입니다.");
         }
 
         long receivedAt = System.currentTimeMillis();

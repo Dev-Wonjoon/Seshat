@@ -1,6 +1,7 @@
 package com.seshat.repair;
 
 import com.seshat.processing.JavaLogProcessor;
+import com.seshat.queue.QueueWorkBarrier;
 import com.seshat.repair.JsonRepairConfiguration.Settings;
 import com.seshat.repair.JsonRepairRepository.Job;
 import com.seshat.repair.JsonRepairRepository.Outcome;
@@ -24,20 +25,27 @@ public class JsonRepairWorker {
     private final JavaLogProcessor processor;
     private final JsonMapper mapper;
     private final Settings settings;
+    private final QueueWorkBarrier workBarrier;
 
     JsonRepairWorker(
             JsonRepairRepository repository, JsonRepairPolicy policy,
-            JavaLogProcessor processor, JsonMapper mapper, Settings settings
+            JavaLogProcessor processor, JsonMapper mapper, Settings settings,
+            QueueWorkBarrier workBarrier
     ) {
         this.repository = repository;
         this.policy = policy;
         this.processor = processor;
         this.mapper = mapper;
         this.settings = settings;
+        this.workBarrier = workBarrier;
     }
 
     @Transactional(propagation = Propagation.NEVER)
     public boolean runOnce() {
+        return workBarrier.process(this::processJob);
+    }
+
+    private boolean processJob() {
         long now = System.currentTimeMillis();
         var activeClient = settings.clients().get(settings.provider());
         var claimed = repository.claim(now, now + settings.timeout().toMillis() + CLAIM_GRACE_MS,

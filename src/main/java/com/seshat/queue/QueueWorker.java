@@ -23,15 +23,18 @@ public class QueueWorker {
     private final QueueProcessingService processing;
     private final ElasticsearchBulkWriter writer;
     private final QueueStorageResultService storageResults;
+    private final QueueWorkBarrier workBarrier;
 
     public QueueWorker(
             QueueProcessingService processing,
             ElasticsearchBulkWriter writer,
-            QueueStorageResultService storageResults
+            QueueStorageResultService storageResults,
+            QueueWorkBarrier workBarrier
     ) {
         this.processing = processing;
         this.writer = writer;
         this.storageResults = storageResults;
+        this.workBarrier = workBarrier;
     }
 
     /**
@@ -40,6 +43,10 @@ public class QueueWorker {
      */
     @Transactional(propagation = Propagation.NEVER)
     public int runOnce() {
+        return workBarrier.process(this::processBatch);
+    }
+
+    private int processBatch() {
         var batch = new ArrayList<PreparedLogEvent>(MAX_BATCH_SIZE);
 
         try {

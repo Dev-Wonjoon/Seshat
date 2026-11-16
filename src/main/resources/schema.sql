@@ -1,3 +1,14 @@
+CREATE TABLE IF NOT EXISTS demo_run (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    source_id TEXT NOT NULL,
+    scenario TEXT NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    state TEXT NOT NULL
+        CHECK (state IN ('RUNNING', 'COMPLETED', 'FAILED', 'DELETING', 'DELETED'))
+);
+
+UPDATE demo_run SET state = 'FAILED' WHERE state = 'RUNNING';
+
 CREATE TABLE IF NOT EXISTS log_queue (
     id INTEGER PRIMARY KEY,
 

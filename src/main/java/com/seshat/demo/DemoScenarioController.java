@@ -12,7 +12,10 @@ import com.seshat.queue.QueueStatsService;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -22,6 +25,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Random;
@@ -56,10 +60,9 @@ public class DemoScenarioController {
     private final AgentControlService control;
     private final AutoModeEvaluator autoMode;
     private final QueueStatsService stats;
+    private final DemoRunCleanupService cleanup;
     private final int port;
     private final Path agentJar;
-    private final Path workRoot =
-            Path.of("build", "demo-runs").toAbsolutePath().normalize();
     private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(2);
     private final ArrayDeque<FinishedRun> finishedRuns = new ArrayDeque<>();
 
@@ -70,6 +73,7 @@ public class DemoScenarioController {
             AgentControlService control,
             Optional<AutoModeEvaluator> autoMode,
             QueueStatsService stats,
+            DemoRunCleanupService cleanup,
             @Value("${server.port:8080}") int port,
             @Value("${seshat.demo.agent-jar:build/libs/agent.jar}") String agentJar
     ) {
@@ -77,6 +81,7 @@ public class DemoScenarioController {
         this.control = control;
         this.autoMode = autoMode.filter(AutoModeEvaluator::demoEnabled).orElse(null);
         this.stats = stats;
+        this.cleanup = cleanup;
         this.port = port;
         this.agentJar = Path.of(agentJar).toAbsolutePath().normalize();
         executor.scheduleWithFixedDelay(this::pruneFinishedRuns, 1, 1, TimeUnit.SECONDS);
@@ -106,6 +111,7 @@ public class DemoScenarioController {
     ) {}
 
     public record StartRequest(Scenario scenario) {}
+    public record CleanupRequest(@JsonProperty("run_ids") List<String> runIds) {}
 
     public record DemoRun(
             @JsonProperty("run_id") String runId,
@@ -135,6 +141,31 @@ public class DemoScenarioController {
     @GetMapping("/parse-failures")
     public long parseFailures(@RequestParam("run_id") String runId) {
         return stats.countParseFailures(runId);
+    }
+
+    @GetMapping("/history")
+    public ResponseEntity<List<DemoRunCleanupService.RunEntry>> history() {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(cleanup.history());
+    }
+
+    @GetMapping("/cleanup")
+    public ResponseEntity<List<DemoRunCleanupService.PreviewEntry>> preview(
+            @RequestParam(value = "run_id", required = false) String runId
+    ) throws IOException {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(cleanup.preview(runId));
+    }
+
+    @PostMapping(value = "/cleanup", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public List<DemoRunCleanupService.CleanupResult> delete(@RequestBody CleanupRequest request) {
+        var results = cleanup.delete(request.runIds());
+        for (var result : results) {
+            if (result.deleted()) clearCurrent(result.runId());
+        }
+        return results;
+    }
+
+    private synchronized void clearCurrent(String runId) {
+        if (current != null && current.runId().equals(runId)) current = null;
     }
 
     @PostMapping
@@ -167,6 +198,7 @@ public class DemoScenarioController {
                 }, 0, 0
         );
         long startedAtNanos = System.nanoTime();
+        cleanup.register(runId, SOURCE_ID, request.scenario());
         current = run;
         executor.execute(() -> execute(run, startedAtNanos));
         return run;
@@ -178,10 +210,10 @@ public class DemoScenarioController {
         String failure = null;
         boolean stress = run.scenario() == Scenario.STRESS;
         Random random = new Random(LOG_SEED);
-        Path directory = workRoot.resolve(run.runId());
+        Path directory = DemoRunCleanupService.workDirectory(run.runId());
 
         try {
-            Files.createDirectories(workRoot);
+            Files.createDirectories(directory.getParent());
             Files.createDirectory(directory);
             Path input = Files.createFile(directory.resolve("app.log"));
 
@@ -478,6 +510,7 @@ public class DemoScenarioController {
     private synchronized void finish(
             DemoRun run, long startedAtNanos, String failure
     ) {
+        cleanup.finish(run.runId(), failure == null);
         if (failure == null) {
             update(run, Phase.COMPLETED,
                     "로그 " + current.generatedCount() + "건 저장을 확인했습니다.");

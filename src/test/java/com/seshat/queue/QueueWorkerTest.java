@@ -28,7 +28,7 @@ class QueueWorkerTest {
             mock(QueueStorageResultService.class);
 
     private final QueueWorker worker =
-            new QueueWorker(processing, writer, storageResults);
+            new QueueWorker(processing, writer, storageResults, new QueueWorkBarrier());
 
     private final JsonMapper mapper = JsonMapper.builder().build();
 
