@@ -34,7 +34,7 @@ public class QueueWorkerRunner implements ApplicationRunner, DisposableBean {
     public QueueWorkerRunner(
             QueueRecoveryService recovery,
             QueueWorker worker,
-            @Value("${seshat.queue.worker-delay-ms:1000}")
+            @Value("${seshat.queue.worker-delay-ms:100}")
             long delayMillis
     ) {
         this(

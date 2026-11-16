@@ -23,7 +23,7 @@ seshat:
 
   queue:
     worker-enabled: false
-    worker-delay-ms: 1000
+    worker-delay-ms: 100
 
   repair:
     enabled: "${SESHAT_REPAIR_ENABLED:false}"
