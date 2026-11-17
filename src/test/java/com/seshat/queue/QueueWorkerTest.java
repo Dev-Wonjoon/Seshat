@@ -8,9 +8,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -34,7 +32,7 @@ class QueueWorkerTest {
 
     @Test
     void 빈_큐에서는_ES를_호출하지_않는다() {
-        when(processing.prepareNext()).thenReturn(Optional.empty());
+        prepared(List.of());
 
         assertEquals(0, worker.runOnce());
 
@@ -57,20 +55,13 @@ class QueueWorkerTest {
                 "Too many requests."
         );
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(first),
-                Optional.of(second),
-                Optional.empty()
-        );
+        prepared(batch);
         when(writer.write(batch)).thenReturn(List.of(success, rejected));
-        when(storageResults.apply(first, success)).thenReturn(true);
-        when(storageResults.apply(second, rejected)).thenReturn(true);
 
         assertEquals(2, worker.runOnce());
 
         verify(writer).write(batch);
-        verify(storageResults).apply(first, success);
-        verify(storageResults).apply(second, rejected);
+        verify(storageResults).applyBatch(batch, List.of(success, rejected));
         verifyNoMoreInteractions(storageResults);
     }
 
@@ -79,13 +70,8 @@ class QueueWorkerTest {
         var first = event(1);
         var cause = new IllegalStateException("Preparation failed.");
 
-        when(processing.prepareNext())
-                .thenReturn(Optional.of(first))
-                .thenThrow(cause);
-
-        when(storageResults.retryAfterFailure(
-                eq(first), anyString()
-        )).thenReturn(true);
+        when(processing.prepareBatch(anyInt(), anyInt()))
+                .thenReturn(new QueueProcessingService.PreparedBatch(List.of(first), cause));
 
         var thrown = assertThrows(
                 IllegalStateException.class,
@@ -94,8 +80,8 @@ class QueueWorkerTest {
 
         assertSame(cause, thrown.getCause());
 
-        verify(storageResults).retryAfterFailure(
-                eq(first),
+        verify(storageResults).retryBatchAfterFailure(
+                eq(List.of(first)),
                 contains("Batch preparation failed")
         );
         verifyNoInteractions(writer);
@@ -109,15 +95,8 @@ class QueueWorkerTest {
         var batch = List.of(first, second);
         var cause = new IOException("Connection refused.");
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(first),
-                Optional.of(second),
-                Optional.empty()
-        );
+        prepared(batch);
         when(writer.write(batch)).thenThrow(cause);
-        when(storageResults.retryAfterFailure(
-                any(PreparedLogEvent.class), anyString()
-        )).thenReturn(true);
 
         var thrown = assertThrows(
                 IllegalStateException.class,
@@ -126,12 +105,8 @@ class QueueWorkerTest {
 
         assertSame(cause, thrown.getCause());
 
-        verify(storageResults).retryAfterFailure(
-                eq(first),
-                contains("Connection refused.")
-        );
-        verify(storageResults).retryAfterFailure(
-                eq(second),
+        verify(storageResults).retryBatchAfterFailure(
+                eq(batch),
                 contains("Connection refused.")
         );
         verifyNoMoreInteractions(storageResults);
@@ -143,14 +118,8 @@ class QueueWorkerTest {
         var event = event(1);
         var cause = new IllegalStateException("Bulk request rejected.");
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(event),
-                Optional.empty()
-        );
+        prepared(List.of(event));
         when(writer.write(List.of(event))).thenThrow(cause);
-        when(storageResults.retryAfterFailure(
-                eq(event), anyString()
-        )).thenReturn(true);
 
         var thrown = assertThrows(
                 IllegalStateException.class,
@@ -159,8 +128,8 @@ class QueueWorkerTest {
 
         assertSame(cause, thrown.getCause());
 
-        verify(storageResults).retryAfterFailure(
-                eq(event),
+        verify(storageResults).retryBatchAfterFailure(
+                eq(List.of(event)),
                 contains("Bulk request rejected.")
         );
         verifyNoMoreInteractions(storageResults);
@@ -173,16 +142,14 @@ class QueueWorkerTest {
         var second = event(2);
         var firstResult = success(first);
         var secondResult = success(second);
+        var batch = List.of(first, second);
+        var results = List.of(firstResult, secondResult);
         var cause = new IllegalStateException("Database unavailable.");
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(first),
-                Optional.of(second),
-                Optional.empty()
-        );
-        when(writer.write(List.of(first, second)))
-                .thenReturn(List.of(firstResult, secondResult));
+        prepared(batch);
+        when(writer.write(batch)).thenReturn(results);
 
+        when(storageResults.applyBatch(batch, results)).thenThrow(cause);
         when(storageResults.apply(first, firstResult)).thenThrow(cause);
         when(storageResults.apply(second, secondResult)).thenReturn(true);
 
@@ -191,6 +158,7 @@ class QueueWorkerTest {
                 worker::runOnce
         );
 
+        assertSame(cause, thrown.getCause());
         assertEquals(1, thrown.getSuppressed().length);
         assertSame(cause, thrown.getSuppressed()[0].getCause());
 
@@ -198,6 +166,7 @@ class QueueWorkerTest {
         verify(storageResults).apply(second, secondResult);
 
         // DB 반영 오류를 ES 전송 실패로 처리하지 않는다.
+        verify(storageResults, never()).retryBatchAfterFailure(anyList(), anyString());
         verify(storageResults, never()).retryAfterFailure(
                 any(PreparedLogEvent.class),
                 anyString()
@@ -209,15 +178,14 @@ class QueueWorkerTest {
             throws IOException {
         var first = event(1);
         var second = event(2);
+        var batch = List.of(first, second);
         var sendFailure = new IOException("Connection refused.");
+        var batchFailure = new IllegalStateException("Batch update failed.");
         var dbFailure = new IllegalStateException("Database unavailable.");
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(first),
-                Optional.of(second),
-                Optional.empty()
-        );
-        when(writer.write(List.of(first, second))).thenThrow(sendFailure);
+        prepared(batch);
+        when(writer.write(batch)).thenThrow(sendFailure);
+        when(storageResults.retryBatchAfterFailure(eq(batch), anyString())).thenThrow(batchFailure);
 
         when(storageResults.retryAfterFailure(
                 eq(first), anyString()
@@ -233,9 +201,11 @@ class QueueWorkerTest {
         );
 
         assertSame(sendFailure, thrown.getCause());
-        assertEquals(1, thrown.getSuppressed().length);
-        assertSame(dbFailure, thrown.getSuppressed()[0].getCause());
+        assertEquals(2, thrown.getSuppressed().length);
+        assertSame(batchFailure, thrown.getSuppressed()[0]);
+        assertSame(dbFailure, thrown.getSuppressed()[1].getCause());
 
+        verify(storageResults).retryBatchAfterFailure(eq(batch), anyString());
         verify(storageResults).retryAfterFailure(
                 eq(first), anyString()
         );
@@ -251,22 +221,19 @@ class QueueWorkerTest {
         var event = event(1);
         var result = success(event);
 
-        when(processing.prepareNext()).thenReturn(
-                Optional.of(event),
-                Optional.empty()
-        );
+        prepared(List.of(event));
         when(writer.write(List.of(event))).thenReturn(List.of(result));
-        when(storageResults.apply(event, result)).thenReturn(false);
+        when(storageResults.applyBatch(List.of(event), List.of(result))).thenReturn(List.of(event));
 
         assertEquals(1, worker.runOnce());
 
-        verify(storageResults).apply(event, result);
+        verify(storageResults).applyBatch(List.of(event), List.of(result));
         verifyNoMoreInteractions(storageResults);
     }
 
     @Test
-    void 한_번에_최대_50건만_준비하고_전송한다() throws IOException {
-        var batch = IntStream.rangeClosed(1, 50)
+    void 한_번에_최대_10000건을_배치로_준비하고_반영한다() throws IOException {
+        var batch = IntStream.rangeClosed(1, 10_000)
                 .mapToObj(this::event)
                 .toList();
 
@@ -274,30 +241,21 @@ class QueueWorkerTest {
                 .map(this::success)
                 .toList();
 
-        var nextIndex = new AtomicInteger();
-
-        when(processing.prepareNext()).thenAnswer(invocation ->
-                Optional.of(batch.get(nextIndex.getAndIncrement()))
-        );
+        prepared(batch);
         when(writer.write(batch)).thenReturn(results);
-        when(storageResults.apply(
-                any(PreparedLogEvent.class),
-                any(BulkItemResult.class)
-        )).thenReturn(true);
 
-        assertEquals(50, worker.runOnce());
+        assertEquals(10_000, worker.runOnce());
 
-        verify(processing, times(50)).prepareNext();
+        verify(processing).prepareBatch(10_000, 32 * 1024 * 1024);
+        verifyNoMoreInteractions(processing);
         verify(writer).write(batch);
-
-        for (int index = 0; index < batch.size(); index++) {
-            verify(storageResults).apply(
-                    batch.get(index),
-                    results.get(index)
-            );
-        }
-
+        verify(storageResults).applyBatch(batch, results);
         verifyNoMoreInteractions(storageResults);
+    }
+
+    private void prepared(List<PreparedLogEvent> batch) {
+        when(processing.prepareBatch(anyInt(), anyInt()))
+                .thenReturn(new QueueProcessingService.PreparedBatch(batch, null));
     }
 
     private PreparedLogEvent event(int id) {

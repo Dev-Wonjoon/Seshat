@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -167,6 +168,29 @@ class ElasticsearchBulkWriterIntegrationTest {
         ).count();
 
         assertEquals(1L, count);
+    }
+
+    @Test
+    void 만_건의_bulk_응답을_요청_순서대로_반환한다() throws IOException {
+        var payload = success("{}");
+        var batch = IntStream.rangeClosed(1, 10_000)
+                .mapToObj(sequence -> prepared(sequence, payload))
+                .toList();
+        try {
+            var results = writer.write(batch);
+
+            assertEquals(10_000, results.size());
+            assertTrue(results.stream().allMatch(BulkItemResult::successful));
+            assertEquals(
+                    batch.stream().map(PreparedLogEvent::queueId).toList(),
+                    results.stream().map(BulkItemResult::queueId).toList()
+            );
+        } finally {
+            client.indices().refresh(request -> request.index(INDEX));
+            client.deleteByQuery(request -> request.index(INDEX)
+                    .query(query -> query.term(term -> term.field("run_id").value(runId)))
+                    .refresh(true));
+        }
     }
 
     @Test

@@ -22,7 +22,7 @@ public class ElasticsearchBulkWriter {
 
     public static final String INDEX = "seshat-logs-v1";
 
-    private static final int MAX_BATCH_SIZE = 50;
+    public static final int MAX_BATCH_SIZE = 10_000;
     private static final int MAX_BULK_REQUEST_BYTES = 32 * 1024 * 1024;
     // 고정 인덱스 이름, SHA-256 문서 ID와 NDJSON 줄바꿈을 포함한 여유분.
     private static final int ACTION_OVERHEAD_BYTES = 256;
@@ -48,7 +48,7 @@ public class ElasticsearchBulkWriter {
             return List.of();
         }
         if (batch.size() > MAX_BATCH_SIZE) {
-            throw new IllegalArgumentException("A bulk request may contain at most 50 events.");
+            throw new IllegalArgumentException("A bulk batch may contain at most " + MAX_BATCH_SIZE + " events.");
         }
 
         var requestIds = new ArrayList<String>(batch.size());

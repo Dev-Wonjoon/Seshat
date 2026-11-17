@@ -15,6 +15,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -23,31 +26,47 @@ import java.util.UUID;
 public class QueueProcessingService {
 
     private static final String CLAIM_SQL = """
+        WITH ready AS MATERIALIZED (
+            SELECT id
+            FROM log_queue
+            WHERE state = 'PENDING'
+               OR (state = 'RETRY_WAIT' AND next_attempt_at_ms <= ?)
+            ORDER BY id
+            LIMIT ?
+        ),
+        sized AS MATERIALIZED (
+            SELECT log_queue.id,
+                   coalesce(octet_length(result_json), octet_length(payload_json)) AS bytes
+            FROM ready JOIN log_queue USING (id)
+        ),
+        bounded AS (
+            SELECT id, bytes, sum(bytes) OVER (ORDER BY id) AS total_bytes
+            FROM sized
+        )
         UPDATE log_queue
         SET state = 'PROCESSING',
             processing_started_at_ms = ?,
             attempt_count = attempt_count + 1,
             next_attempt_at_ms = 0
-        WHERE id = (
-            SELECT id
-            FROM log_queue
-            WHERE state = 'PENDING'
-               OR (
-                   state = 'RETRY_WAIT'
-                   AND next_attempt_at_ms <= ?
-               )
-            ORDER BY id
-            LIMIT 1
+        WHERE id IN (
+            SELECT id FROM bounded
+            WHERE total_bytes <= ? OR total_bytes = bytes
         )
-          AND (
-              state = 'PENDING'
-              OR (
-                  state = 'RETRY_WAIT'
-                  AND next_attempt_at_ms <= ?
-              )
-          )
         RETURNING id, run_id, source_id, event_id, mode,
-                  payload_json, result_json, attempt_count
+                  CASE WHEN result_json IS NULL THEN payload_json END AS payload_json,
+                  result_json, attempt_count
+        """;
+
+    private static final String SAVE_SQL = """
+        UPDATE log_queue
+        SET result_json = ?
+        WHERE id = ? AND state = 'PROCESSING' AND attempt_count = ?
+        """;
+
+    private static final String RELEASE_SQL = """
+        UPDATE log_queue
+        SET state = 'PENDING', processing_started_at_ms = NULL, attempt_count = attempt_count - ?
+        WHERE id = ? AND state = 'PROCESSING' AND attempt_count = ?
         """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -75,41 +94,58 @@ public class QueueProcessingService {
 
     @Transactional(propagation = Propagation.NEVER)
     public Optional<PreparedLogEvent> prepareNext() {
-        var next = claimNext();
-
-        if(next.isEmpty()) {
-            return Optional.empty();
+        var batch = prepareBatch(1, Integer.MAX_VALUE);
+        if (batch.failure() != null) {
+            throw batch.failure();
         }
-
-        var queued = next.get();
-
-        try {
-            ObjectNode result = prepareResult(queued);
-            String resultJson = mapper.writeValueAsString(result);
-
-            saveResult(queued, result, resultJson);
-
-            return Optional.of(new PreparedLogEvent(
-                    queued.id(),
-                    queued.runId(),
-                    queued.sourceId(),
-                    queued.eventId(),
-                    queued.mode(),
-                    result,
-                    queued.attemptCount()
-            ));
-        } catch (RuntimeException exception) {
-            try {
-                release(queued);
-            } catch (RuntimeException runtimeException) {
-                exception.addSuppressed(runtimeException);
-            }
-
-            throw exception;
-        }
+        return batch.events().stream().findFirst();
     }
 
-    private Optional<ClaimedEvent> claimNext() {
+    @Transactional(propagation = Propagation.NEVER)
+    public PreparedBatch prepareBatch(int maxEvents, int maxBytes) {
+        if (maxEvents < 1 || maxBytes < 1) {
+            throw new IllegalArgumentException("Queue batch limits must be positive.");
+        }
+        var claimed = claimBatch(maxEvents, maxBytes);
+        if (claimed.isEmpty()) {
+            return new PreparedBatch(List.of(), null);
+        }
+        var prepared = new ArrayList<PreparedLogEvent>(claimed.size());
+        var updates = new ArrayList<Object[]>(claimed.size());
+        RuntimeException preparationFailure = null;
+        try {
+            for (var queued : claimed) {
+                var result = prepareResult(queued);
+                var json = mapper.writeValueAsString(result);
+                updates.add(new Object[]{json, queued.id(), queued.attemptCount()});
+                prepared.add(new PreparedLogEvent(
+                        queued.id(), queued.runId(), queued.sourceId(), queued.eventId(),
+                        queued.mode(), result, queued.attemptCount()
+                ));
+            }
+        } catch (RuntimeException exception) {
+            preparationFailure = exception;
+        }
+
+        try {
+            var remaining = claimed.subList(prepared.size(), claimed.size());
+            transactions.executeWithoutResult(status -> {
+                saveResults(prepared, updates);
+                release(remaining, 1);
+            });
+        } catch (RuntimeException exception) {
+            try {
+                int attemptedCount = prepared.size() + (preparationFailure == null ? 0 : 1);
+                transactions.executeWithoutResult(status -> release(claimed, attemptedCount));
+            } catch (RuntimeException releaseFailure) {
+                exception.addSuppressed(releaseFailure);
+            }
+            throw exception;
+        }
+        return new PreparedBatch(List.copyOf(prepared), preparationFailure);
+    }
+
+    private List<ClaimedEvent> claimBatch(int maxEvents, int maxBytes) {
         var events = transactions.execute(status -> {
             long now = System.currentTimeMillis();
 
@@ -125,13 +161,14 @@ public class QueueProcessingService {
                             resultSet.getString("result_json"),
                             resultSet.getInt("attempt_count")
                     ),
-                    now,
-                    now,
-                    now
+                    now, maxEvents, now, maxBytes
             );
         });
 
-        return Objects.requireNonNull(events).stream().findFirst();
+        // SQLite RETURNING의 행 순서는 보장되지 않는다.
+        return Objects.requireNonNull(events).stream()
+                .sorted(Comparator.comparingLong(ClaimedEvent::id))
+                .toList();
     }
 
     private ObjectNode prepareResult(ClaimedEvent queued) {
@@ -176,55 +213,33 @@ public class QueueProcessingService {
         return result;
     }
 
-    private void saveResult(
-            ClaimedEvent queued,
-            ObjectNode result,
-            String resultJson
-    ) {
-        transactions.executeWithoutResult(status -> {
-            int updated = jdbcTemplate.update(
-                    """
-                    UPDATE log_queue
-                    SET result_json = ?
-                    WHERE id = ?
-                      AND state = 'PROCESSING'
-                      AND attempt_count = ?
-                    """,
-                    resultJson,
-                    queued.id(),
-                    queued.attemptCount()
-            );
-
+    private void saveResults(List<PreparedLogEvent> events, List<Object[]> updates) {
+        for (int updated : jdbcTemplate.batchUpdate(SAVE_SQL, updates)) {
             if (updated != 1) {
-                throw new IllegalStateException(
-                        "The claimed event could not be updated."
-                );
+                throw new IllegalStateException("The claimed event could not be updated.");
             }
-
-            if (repairEnabled
-                    && ParseStatus.FAILED.name().equals(result.path("parse_status").stringValue())
-                    && "INVALID_JSON".equals(result.at("/parse_error/code").stringValue())) {
-                repairJobs.register(queued.runId(), queued.sourceId(), queued.eventId().toString());
+        }
+        if (repairEnabled) {
+            for (var event : events) {
+                var result = event.result();
+                if (ParseStatus.FAILED.name().equals(result.path("parse_status").stringValue())
+                        && "INVALID_JSON".equals(result.at("/parse_error/code").stringValue())) {
+                    repairJobs.register(event.runId(), event.sourceId(), event.eventId().toString());
+                }
             }
-        });
+        }
     }
 
-    private void release(ClaimedEvent queued) {
-        transactions.executeWithoutResult(status ->
-                jdbcTemplate.update(
-                        """
-                        UPDATE log_queue
-                        SET state = 'PENDING',
-                            processing_started_at_ms = NULL
-                        WHERE id = ?
-                          AND state = 'PROCESSING'
-                          AND attempt_count = ?
-                        """,
-                        queued.id(),
-                        queued.attemptCount()
-                )
-        );
+    private void release(List<ClaimedEvent> events, int attemptedCount) {
+        var updates = new ArrayList<Object[]>(events.size());
+        for (int index = 0; index < events.size(); index++) {
+            var event = events.get(index);
+            updates.add(new Object[]{index < attemptedCount ? 0 : 1, event.id(), event.attemptCount()});
+        }
+        jdbcTemplate.batchUpdate(RELEASE_SQL, updates);
     }
+
+    public record PreparedBatch(List<PreparedLogEvent> events, RuntimeException failure) {}
 
     private record ClaimedEvent(
             long id,

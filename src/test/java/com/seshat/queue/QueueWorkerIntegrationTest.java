@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -39,6 +40,9 @@ class QueueWorkerIntegrationTest {
 
     @Autowired
     private QueueWorker worker;
+
+    @Autowired
+    private QueueProcessingService processing;
 
     @Autowired
     private LogBatchStorageService storage;
@@ -236,6 +240,71 @@ class QueueWorkerIntegrationTest {
 
         verifyNoInteractions(processor);
         verify(writer, times(2)).write(anyList());
+    }
+
+    @Test
+    void 만_건을_먼저_저장하고_초과분은_다음_배치에서_처리한다() throws IOException {
+        var events = IntStream.rangeClosed(1, 10_001)
+                .mapToObj(index -> central("{}"))
+                .toList();
+        for (int offset = 0; offset < events.size(); offset += 50) {
+            var slice = events.subList(offset, Math.min(offset + 50, events.size()));
+            storage.store(new LogBatchRequest(runId, "source-01", ParsingMode.CENTRAL, slice));
+        }
+        var sent = new ArrayList<UUID>();
+        when(writer.write(anyList())).thenAnswer(invocation -> {
+            List<PreparedLogEvent> batch = invocation.getArgument(0);
+            batch.forEach(event -> sent.add(event.eventId()));
+            return batch.stream().map(event -> result(event, true, 201, null)).toList();
+        });
+
+        assertEquals(10_000, worker.runOnce());
+        assertState(events.get(9_999), "COMPLETED", 1);
+        var remainder = row(events.getLast());
+        assertEquals("PENDING", remainder.get("state"));
+        assertEquals(0, number(remainder, "attempt_count"));
+
+        assertEquals(1, worker.runOnce());
+        assertEquals(events.stream().map(LogEventRequest::eventId).toList(), sent);
+        assertEquals(10_001, jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM log_queue WHERE run_id = ? AND state = 'COMPLETED'",
+                Integer.class, runId
+        ));
+    }
+
+    @Test
+    void 바이트_한도를_넘는_첫_이벤트도_단독으로_선점한다() {
+        var first = central("{\"message\":\"" + "가".repeat(80) + "\"}");
+        var second = central("{}");
+        store(first, second);
+
+        long beforeClaim = System.currentTimeMillis();
+        var batch = processing.prepareBatch(10_000, 240);
+
+        assertNull(batch.failure());
+        assertEquals(List.of(first.eventId()), batch.events().stream().map(PreparedLogEvent::eventId).toList());
+        assertTrue(number(row(first), "processing_started_at_ms") >= beforeClaim);
+        assertEquals("PENDING", row(second).get("state"));
+        assertEquals(0, number(row(second), "attempt_count"));
+    }
+
+    @Test
+    void 준비_실패_후_파싱하지_않은_항목은_시도_횟수를_보존한다() {
+        var first = central("{}");
+        var second = central("{\"message\":\"fails\"}");
+        var third = central("{\"message\":\"not reached\"}");
+        store(first, second, third);
+        doThrow(new IllegalStateException("Forced processing failure."))
+                .when(processor).process(second.raw());
+
+        assertThrows(IllegalStateException.class, worker::runOnce);
+
+        assertState(first, "RETRY_WAIT", 1);
+        assertEquals("PENDING", row(second).get("state"));
+        assertEquals(1, number(row(second), "attempt_count"));
+        assertEquals("PENDING", row(third).get("state"));
+        assertEquals(0, number(row(third), "attempt_count"));
+        verifyNoInteractions(writer);
     }
 
     private void assertNoDatabaseTransaction() {

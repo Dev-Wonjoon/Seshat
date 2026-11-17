@@ -6,6 +6,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -48,6 +50,22 @@ public class QueueStorageResultService {
             PreparedLogEvent event,
             BulkItemResult result
     ) {
+        return applyBatch(List.of(event), List.of(result)).isEmpty();
+    }
+
+    @Transactional
+    public List<PreparedLogEvent> applyBatch(List<PreparedLogEvent> events, List<BulkItemResult> results) {
+        if (events.size() != results.size()) {
+            throw new IllegalArgumentException("The number of storage results does not match the batch.");
+        }
+        var updates = new ArrayList<Object[]>(events.size());
+        for (int index = 0; index < events.size(); index++) {
+            updates.add(resultUpdate(events.get(index), results.get(index)));
+        }
+        return updateBatch(events, updates);
+    }
+
+    private Object[] resultUpdate(PreparedLogEvent event, BulkItemResult result) {
         validateEvent(event);
         Objects.requireNonNull(result, "result");
 
@@ -62,7 +80,7 @@ public class QueueStorageResultService {
                     || result.errorReason() != null) {
                 throw new IllegalArgumentException("The successful result contains an invalid status or error.");
             }
-            return update(event, "COMPLETED", 0, null);
+            return updateArguments(event, "COMPLETED", 0, null);
         }
 
         String error = "%d / %s: %s".formatted(
@@ -72,10 +90,10 @@ public class QueueStorageResultService {
         );
 
         if(isDocumentError(result)) {
-            return update(event, "STORAGE_FAILED", 0, error);
+            return updateArguments(event, "STORAGE_FAILED", 0, error);
         }
 
-        return update(event, "RETRY_WAIT", nextAttemptAt(event.attemptCount()), error);
+        return updateArguments(event, "RETRY_WAIT", nextAttemptAt(event.attemptCount()), error);
     }
 
     @Transactional
@@ -83,10 +101,18 @@ public class QueueStorageResultService {
             PreparedLogEvent event,
             String errorMessage
     ) {
-        validateEvent(event);
-        Objects.requireNonNull(errorMessage, "errorMessage");
+        return retryBatchAfterFailure(List.of(event), errorMessage).isEmpty();
+    }
 
-        return update(event, "RETRY_WAIT", nextAttemptAt(event.attemptCount()), errorMessage);
+    @Transactional
+    public List<PreparedLogEvent> retryBatchAfterFailure(List<PreparedLogEvent> events, String errorMessage) {
+        Objects.requireNonNull(errorMessage, "errorMessage");
+        var updates = new ArrayList<Object[]>(events.size());
+        for (var event : events) {
+            validateEvent(event);
+            updates.add(updateArguments(event, "RETRY_WAIT", nextAttemptAt(event.attemptCount()), errorMessage));
+        }
+        return updateBatch(events, updates);
     }
 
     private boolean isDocumentError(BulkItemResult result) {
@@ -105,9 +131,8 @@ public class QueueStorageResultService {
         return System.currentTimeMillis() + delayMillis;
     }
 
-    private boolean update(PreparedLogEvent event, String state, long nextAttempt, String error) {
-        int updated = jdbcTemplate.update(
-                UPDATE_SQL,
+    private Object[] updateArguments(PreparedLogEvent event, String state, long nextAttempt, String error) {
+        return new Object[]{
                 state,
                 nextAttempt,
                 error,
@@ -116,9 +141,18 @@ public class QueueStorageResultService {
                 event.sourceId(),
                 event.eventId().toString(),
                 event.attemptCount()
-        );
+        };
+    }
 
-        return updated == 1;
+    private List<PreparedLogEvent> updateBatch(List<PreparedLogEvent> events, List<Object[]> updates) {
+        var skipped = new ArrayList<PreparedLogEvent>();
+        int[] counts = jdbcTemplate.batchUpdate(UPDATE_SQL, updates);
+        for (int index = 0; index < counts.length; index++) {
+            if (counts[index] != 1) {
+                skipped.add(events.get(index));
+            }
+        }
+        return skipped;
     }
 
     private void validateEvent(PreparedLogEvent event) {

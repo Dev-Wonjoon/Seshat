@@ -9,7 +9,6 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 
 @Service
@@ -18,7 +17,7 @@ public class QueueWorker {
     private static final Logger log =
             LoggerFactory.getLogger(QueueWorker.class);
 
-    private static final int MAX_BATCH_SIZE = 50;
+    private static final int MAX_QUEUE_BATCH_BYTES = 32 * 1024 * 1024;
 
     private final QueueProcessingService processing;
     private final ElasticsearchBulkWriter writer;
@@ -47,27 +46,24 @@ public class QueueWorker {
     }
 
     private int processBatch() {
-        var batch = new ArrayList<PreparedLogEvent>(MAX_BATCH_SIZE);
-
+        QueueProcessingService.PreparedBatch preparation;
         try {
-            for (int index = 0; index < MAX_BATCH_SIZE; index++) {
-                var next = processing.prepareNext();
-
-                if (next.isEmpty()) {
-                    break;
-                }
-
-                batch.add(next.get());
-            }
+            preparation = processing.prepareBatch(
+                    ElasticsearchBulkWriter.MAX_BATCH_SIZE, MAX_QUEUE_BATCH_BYTES
+            );
         } catch (RuntimeException exception) {
+            throw new IllegalStateException("Failed to prepare the queue batch.", exception);
+        }
+        var batch = preparation.events();
+        if (preparation.failure() != null) {
             var failure = new IllegalStateException(
                     "Failed to prepare the queue batch.",
-                    exception
+                    preparation.failure()
             );
 
             retryPrepared(
                     batch,
-                    "Batch preparation failed: " + describe(exception),
+                    "Batch preparation failed: " + describe(preparation.failure()),
                     failure
             );
 
@@ -83,7 +79,7 @@ public class QueueWorker {
         // 이 try에는 ES 전송만 포함한다.
         // 아래의 DB 결과 반영 오류가 전송 실패로 처리되지 않게 한다.
         try {
-            results = writer.write(List.copyOf(batch));
+            results = writer.write(batch);
         } catch (IOException | RuntimeException exception) {
             var failure = new IllegalStateException(
                     "The Elasticsearch bulk request failed.",
@@ -99,9 +95,25 @@ public class QueueWorker {
             throw failure;
         }
 
-        IllegalStateException updateFailure = null;
+        try {
+            storageResults.applyBatch(batch, results).forEach(this::logSkipped);
+        } catch (RuntimeException batchFailure) {
+            // 배치 갱신이 롤백되면 개별 반영을 시도해 나머지 이벤트를 방치하지 않는다.
+            var failure = new IllegalStateException(
+                    "Failed to apply one or more bulk results to the queue.", batchFailure
+            );
+            applyIndividually(batch, results, failure);
+            throw failure;
+        }
+        return batch.size();
+    }
 
-        // writer가 응답 개수와 순서별 문서 ID를 검증한다.
+    private void applyIndividually(
+            List<PreparedLogEvent> batch, List<BulkItemResult> results, RuntimeException failure
+    ) {
+        if (results.size() != batch.size()) {
+            return;
+        }
         for (int index = 0; index < batch.size(); index++) {
             var event = batch.get(index);
 
@@ -115,13 +127,7 @@ public class QueueWorker {
                     logSkipped(event);
                 }
             } catch (RuntimeException exception) {
-                if (updateFailure == null) {
-                    updateFailure = new IllegalStateException(
-                            "Failed to apply one or more bulk results to the queue."
-                    );
-                }
-
-                updateFailure.addSuppressed(new IllegalStateException(
+                failure.addSuppressed(new IllegalStateException(
                         "Failed to apply the result for queueId="
                                 + event.queueId()
                                 + ", attemptCount="
@@ -131,11 +137,6 @@ public class QueueWorker {
             }
         }
 
-        if (updateFailure != null) {
-            throw updateFailure;
-        }
-
-        return batch.size();
     }
 
     private void retryPrepared(
@@ -143,6 +144,15 @@ public class QueueWorker {
             String errorMessage,
             RuntimeException failure
     ) {
+        if (events.isEmpty()) {
+            return;
+        }
+        try {
+            storageResults.retryBatchAfterFailure(events, errorMessage).forEach(this::logSkipped);
+            return;
+        } catch (RuntimeException batchFailure) {
+            failure.addSuppressed(batchFailure);
+        }
         for (var event : events) {
             try {
                 boolean updated = storageResults.retryAfterFailure(
