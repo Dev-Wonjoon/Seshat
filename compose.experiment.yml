@@ -37,7 +37,7 @@ services:
       - /etc/seshat/demo.env
 
   web:
-    build: ../seshat-web
+    build: ../papyrus
     ports:
       - "127.0.0.1:5000:80"
     restart: unless-stopped

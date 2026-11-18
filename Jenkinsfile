@@ -78,7 +78,7 @@ def skip(reason):
     raise SystemExit(0)
 
 
-repositories = ("Dev-Wonjoon/Seshat", "Dev-Wonjoon/Seshat-web")
+repositories = ("Dev-Wonjoon/Seshat", "Dev-Wonjoon/Papyrus")
 revisions = [read_github(repository, "git/ref/heads/main")["object"]["sha"]
              for repository in repositories]
 state_file = Path.home() / ".local/state/seshat-deploy/revisions"
@@ -129,7 +129,7 @@ PY
             steps {
                 script {
                     checkoutRevision('seshat', 'Dev-Wonjoon/Seshat', env.BACKEND_SHA)
-                    checkoutRevision('seshat-web', 'Dev-Wonjoon/Seshat-web', env.WEB_SHA)
+                    checkoutRevision('papyrus', 'Dev-Wonjoon/Papyrus', env.WEB_SHA)
                 }
             }
         }
